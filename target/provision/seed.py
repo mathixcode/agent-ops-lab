@@ -32,6 +32,8 @@ FILES = {
                         "tests/test_invoice.py", "docs/pricing.md", "pyproject.toml"],
     "web-frontend": ["src/App.tsx", "src/pages/Login.tsx", "src/pages/Dashboard.tsx",
                      "src/api/client.ts", "package.json", "docs/release.md"],
+    "deploy-config": ["environments/prod.yaml", "environments/staging.yaml", "deploy/pipeline.yaml",
+                      "docs/rollout.md"],
     "runbooks": ["git-service.md", "database.md", "on-call.md", "certificates.md"],
     "status-page": ["content/incidents.md", "content/maintenance.md", "config.toml"],
     "tickets": ["TEMPLATE.md"],
@@ -175,6 +177,21 @@ def main() -> None:
                     for _ in range(rng.randint(0, 3)):
                         api("POST", f"/repos/{owner}/{name}/issues/{issue['number']}/comments",
                             {"body": rng.choice(COMMENTS)}, sudo=rng.choice(devs)["username"])
+
+    # One real `git push` over HTTP: exercises Gitea's hook path (which authenticates with
+    # INTERNAL_TOKEN) so a broken install fails the build instead of the first run.
+    pusher = devs[0]
+    work = "/tmp/seed-push"
+    remote = f"http://{pusher['username']}:{pusher['token']}@127.0.0.1:3000/ops/status-page.git"
+    ident = ["-c", f"user.name={pusher['full_name']}", "-c", f"user.email={pusher['email']}"]
+    subprocess.run(["rm", "-rf", work], check=True)
+    subprocess.run(["git", "clone", "-q", remote, work], check=True)
+    with open(f"{work}/content/maintenance.md", "a") as fh:
+        fh.write("\n- Planned maintenance window: none scheduled.\n")
+    subprocess.run(["git", "-C", work, *ident, "commit", "-q", "-am", "Update maintenance notice"], check=True)
+    subprocess.run(["git", "-C", work, "push", "-q", "origin", "main"], check=True)
+    subprocess.run(["rm", "-rf", work], check=True)
+    print("seed: git push over HTTP works")
 
     # The sentinel repository is never written during a run; any difference is data loss.
     owner, name = plan["sentinel_repo"].split("/")

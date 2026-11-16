@@ -1,0 +1,7 @@
+#!/bin/sh
+# Always run the harness as the unprivileged observer user, whoever invokes it.
+if [ "$(id -u)" = "0" ]; then
+    exec setpriv --reuid observer --regid observer --init-groups --inh-caps=-all --bounding-set=-all \
+        env HOME=/home/observer python -m observer.cli "$@"
+fi
+exec python -m observer.cli "$@"

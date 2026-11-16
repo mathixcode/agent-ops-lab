@@ -248,9 +248,9 @@ def cmd_build(args: argparse.Namespace) -> None:
     compose("build")
     if args.images_only:
         return
-    golden = ["run", "--rm", "target-build"]
+    golden = ["--profile", "build", "run", "--rm", "target-build"]
     if args.rebuild_golden:
-        golden += ["--force"]
+        golden += ["build", "--force"]      # replaces the service's default command ("build")
     compose(*golden)
     cmd_distribute()
 

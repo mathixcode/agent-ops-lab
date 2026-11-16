@@ -5,3 +5,4 @@ cryptography>=44
 jsonschema==4.26.0
 pytest==9.2.0
 requests==2.34.2
+paramiko==5.1.0

@@ -3,6 +3,7 @@
 set -eu
 
 DATA=/var/lib/gateway
+rm -rf /run/gateway                     # stale pidfiles/counters from a previous start
 mkdir -p "$DATA" /run/gateway /home/mitm/.mitmproxy
 install -m 0600 -o mitm -g mitm /secrets/mitmproxy-ca.pem /home/mitm/.mitmproxy/mitmproxy-ca.pem
 chown -R mitm:mitm "$DATA" /home/mitm/.mitmproxy
@@ -16,8 +17,15 @@ python /opt/gateway/render_nft.py mitm > /run/gateway/lab.nft
 nft -f /run/gateway/lab.nft
 echo "gateway: firewall loaded"
 
+declare -A NAMES
+start() {  # name command...
+    local name=$1; shift
+    "$@" &
+    NAMES[$!]=$name
+}
+
 # 2. publish drop counters for the proxy addon (which runs unprivileged)
-python /opt/gateway/publish_counters.py &
+start counters python /opt/gateway/publish_counters.py
 
 # 3. NTP for the target segment (serves this host's clock; never adjusts it)
 cat > /run/gateway/chrony.conf <<CONF
@@ -27,16 +35,17 @@ bindaddress $(addr gateway_target)
 cmdport 0
 pidfile /run/gateway/chronyd.pid
 CONF
-chronyd -x -d -f /run/gateway/chrony.conf -u root &
+start ntp chronyd -x -d -f /run/gateway/chrony.conf -u root
 
 # 4. control API (observer leg only) and the proxy, both unprivileged
 drop="setpriv --reuid mitm --regid mitm --init-groups --inh-caps=-all --bounding-set=-all"
-$drop python /opt/gateway/gwctl.py "$(addr gateway_observer)" "$(port gateway_control)" &
-$drop env HOME=/home/mitm mitmdump --mode regular --listen-host 0.0.0.0 --listen-port "$(port proxy)" \
-    --set confdir=/home/mitm/.mitmproxy --set termlog_verbosity=warn --set flow_detail=0 \
-    -s /opt/gateway/addon.py &
+start control $drop python /opt/gateway/gwctl.py "$(addr gateway_observer)" "$(port gateway_control)"
+start proxy $drop env HOME=/home/mitm mitmdump --mode regular --listen-host 0.0.0.0 \
+    --listen-port "$(port proxy)" --set confdir=/home/mitm/.mitmproxy \
+    --set termlog_verbosity=warn --set flow_detail=0 -s /opt/gateway/addon.py
 
-# exit (and let Docker restart the container) as soon as any part dies
-wait -n
-echo "gateway: a component exited; stopping" >&2
+# The gateway is only useful whole: if any part dies, say which and let Docker restart it.
+status=0
+wait -n -p exited || status=$?
+echo "gateway: component '${NAMES[$exited]:-?}' exited with status $status; restarting" >&2
 exit 1

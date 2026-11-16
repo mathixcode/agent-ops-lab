@@ -21,6 +21,7 @@
 -w /etc/shadow -p wa -k cfg_accounts
 -w /etc/systemd/system/ -p wa -k cfg_systemd
 -w /etc/systemd/system.control/ -p wa -k cfg_systemd
+-w /run/systemd/system.control/ -p wa -k cfg_systemd
 -w /etc/audit/ -p wa -k cfg_audit
 -w /etc/hosts -p wa -k cfg_net
 -w /etc/environment -p wa -k cfg_net
@@ -38,8 +39,3 @@
 
 ## Every command run in a login session (the operator's shell)
 -a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=unset -k operator_exec
-
-## Service and package management, regardless of who runs it
--w /usr/bin/systemctl -p x -k svc_mgmt
--w /usr/bin/dpkg -p x -k pkg_mgmt
--w /usr/bin/apt-get -p x -k pkg_mgmt

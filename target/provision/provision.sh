@@ -120,7 +120,7 @@ install -d -m 0700 -o git -g git /var/backups/gitea
 
 log "waiting for gitea"
 for _ in $(seq 1 120); do
-    curl -fsS -o /dev/null http://127.0.0.1:3000/api/healthz && break
+    curl -fs -o /dev/null http://127.0.0.1:3000/api/healthz && break
     sleep 2
 done
 curl -fsS http://127.0.0.1:3000/api/healthz >/dev/null
@@ -142,10 +142,16 @@ sed -i -e 's/^log_group *=.*/log_group = auditlog/' \
        -e 's/^log_format *=.*/log_format = ENRICHED/' \
        -e 's/^max_log_file *=.*/max_log_file = 50/' \
        -e 's/^num_logs *=.*/num_logs = 8/' /etc/audit/auditd.conf
+# every watched directory must exist when the rules load, at provisioning and at each boot
+echo 'd /run/systemd/system.control 0755 root root -' > /etc/tmpfiles.d/lab-audit-watch.conf
+mkdir -p /run/systemd/system.control /etc/systemd/system.control /etc/ssh/sshd_config.d
 systemctl enable auditd
 systemctl restart auditd
 augenrules --load
-auditctl -l | grep -q cfg_gitea
+EXPECTED_RULES=$(grep -cE '^-(w|a) ' /etc/audit/rules.d/lab.rules)
+LOADED_RULES=$(auditctl -l | grep -cE '^-(w|a) ')
+[ "$LOADED_RULES" -eq "$EXPECTED_RULES" ] || {
+    echo "auditd: $LOADED_RULES of $EXPECTED_RULES rules loaded" >&2; auditctl -l >&2; exit 1; }
 
 log "time, egress proxy"
 cat > /etc/chrony/chrony.conf <<EOF
@@ -189,7 +195,10 @@ EOF
 systemctl enable systemd-networkd >/dev/null 2>&1
 systemctl disable networking >/dev/null 2>&1 || true
 systemctl disable systemd-networkd-wait-online >/dev/null 2>&1 || true
-# No DNS inside the lab: outbound names are resolved by the egress proxy.
+# No DNS inside the lab: outbound names are resolved by the egress proxy. Without a resolver
+# there is also no reason to keep systemd-resolved (and its LLMNR listener on 5355) around.
+systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+systemctl mask systemd-resolved >/dev/null 2>&1 || true
 if [ -L /etc/resolv.conf ] || [ -f /etc/resolv.conf ]; then rm -f /etc/resolv.conf; fi
 echo "# no resolver: egress goes through the proxy at $PROXY" > /etc/resolv.conf
 touch /etc/cloud/cloud-init.disabled
