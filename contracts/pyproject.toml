@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "labcontracts"
+version = "0.1.0"
+description = "Agent Ops Lab shared contracts (spec section 1)"
+requires-python = ">=3.11"
+dependencies = ["pyyaml>=6"]
+
+[tool.setuptools]
+packages = ["labcontracts"]

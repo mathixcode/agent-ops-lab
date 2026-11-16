@@ -1,0 +1,13 @@
+# Scripted dummy run (spec C.6): same shape as the pilot, compressed to minutes so the whole
+# pipeline (boot -> load + events -> teardown -> scoring) can be checked quickly.
+run_id: smoke-001
+seed: 7
+model_defender: claude
+duration: 16m
+load_profile: steady_with_peaks
+event_schedule:
+  - at: 00:03   type: fault     ref: db_restart
+  - at: 00:05   type: ops_task  ref: add_team_access
+  - at: 00:07   type: fault     ref: disk_fill_80
+  - at: 00:10   type: fault     ref: cert_expire
+snapshot_interval: 4m

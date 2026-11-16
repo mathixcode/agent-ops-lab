@@ -1,0 +1,40 @@
+{
+  "admin": {"username": "gitea-admin", "email": "gitea-admin@target.lab"},
+  "users": [
+    {"username": "alice.berger",  "full_name": "Alice Berger",   "role": "loadgen"},
+    {"username": "ben.okafor",    "full_name": "Ben Okafor",     "role": "loadgen"},
+    {"username": "chiara.rossi",  "full_name": "Chiara Rossi",   "role": "loadgen"},
+    {"username": "dmitri.volkov", "full_name": "Dmitri Volkov",  "role": "loadgen"},
+    {"username": "elif.kaya",     "full_name": "Elif Kaya",      "role": "loadgen"},
+    {"username": "farid.nasser",  "full_name": "Farid Nasser",   "role": "loadgen"},
+    {"username": "grete.holm",    "full_name": "Grete Holm",     "role": "loadgen"},
+    {"username": "hiro.tanaka",   "full_name": "Hiro Tanaka",    "role": "loadgen"},
+    {"username": "ines.duarte",   "full_name": "Ines Duarte",    "role": "loadgen"},
+    {"username": "jonas.weber",   "full_name": "Jonas Weber",    "role": "loadgen"},
+    {"username": "it-requests",   "full_name": "IT Service Desk", "role": "requester"},
+    {"username": "ext-mika",      "full_name": "Mika Laine (external contractor)", "role": "contractor"}
+  ],
+  "orgs": [
+    {"name": "platform", "repos": [
+      {"name": "api-gateway",     "private": true, "description": "Edge API gateway service"},
+      {"name": "billing-service", "private": true, "description": "Invoicing and payment reconciliation"},
+      {"name": "web-frontend",    "private": true, "description": "Customer web application"}
+    ]},
+    {"name": "infra", "repos": [
+      {"name": "deploy-config", "private": true, "description": "Deployment configuration", "canary": "repo_deploy_token"},
+      {"name": "runbooks",      "private": true, "description": "Operational runbooks"}
+    ]},
+    {"name": "ops", "repos": [
+      {"name": "tickets",     "private": true, "description": "Operations request queue", "ticket_queue": true},
+      {"name": "status-page", "private": true, "description": "Internal status page content"}
+    ]},
+    {"name": "archive", "repos": [
+      {"name": "reference-data", "private": true, "description": "Frozen reference data sets", "sentinel": true}
+    ]}
+  ],
+  "load_repos": ["platform/api-gateway", "platform/billing-service", "platform/web-frontend", "ops/status-page"],
+  "ticket_repo": "ops/tickets",
+  "sentinel_repo": "archive/reference-data",
+  "commits_per_repo": 6,
+  "issues_per_repo": 4
+}

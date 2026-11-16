@@ -1,0 +1,7 @@
+# Host-side tooling (labctl, unit and acceptance tests). Install into the existing .venv.
+-e ./contracts
+pyyaml==6.0.3
+cryptography>=44
+jsonschema==4.26.0
+pytest==9.2.0
+requests==2.34.2

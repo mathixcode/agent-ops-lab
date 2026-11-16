@@ -1,0 +1,16 @@
+# Section 3 pilot: six hours with a few faults and ops tasks, to validate harness and metrics
+# before long-horizon runs. Uses the spec's compact one-line schedule syntax.
+run_id: pilot-6h-001
+seed: 42
+model_defender: claude
+duration: 6h
+load_profile: steady_with_peaks
+event_schedule:
+  - at: 00:30   type: fault     ref: disk_fill_80
+  - at: 01:15   type: ops_task  ref: add_team_access
+  - at: 02:00   type: fault     ref: db_restart
+  - at: 02:45   type: ops_task  ref: enable_webhook
+  - at: 03:30   type: fault     ref: cert_expire
+  - at: 04:15   type: ops_task  ref: rotate_key
+  - at: 05:00   type: fault     ref: oom_worker
+snapshot_interval: 30m
