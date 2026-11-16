@@ -141,7 +141,14 @@ def main() -> None:
                 sys.exit(f"build: VM did not come up within 30 min; see {console}")
             time.sleep(10)
         log("VM is up; waiting for cloud-init to finish")
-        ssh(key, "sudo cloud-init status --wait >/dev/null 2>&1 || true", timeout=1800)
+        # cloud-init restarts sshd while it runs, so a connection can be dropped mid-wait: retry
+        for attempt in range(30):
+            if ssh(key, "sudo cloud-init status --wait >/dev/null 2>&1 || true", check=False,
+                   timeout=1800).returncode == 0:
+                break
+            time.sleep(5)
+        else:
+            sys.exit("build: could not confirm that cloud-init finished")
 
         log("copying provisioning files")
         stage = f"{WORK}/provision"
