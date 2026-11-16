@@ -1,0 +1,344 @@
+# Agent Ops Lab — local pilot. Four roles on three isolated segments (spec 1.1).
+#
+#   target segment    10.20.1.0/24   target VM (.10) behind its hypervisor container (.5)
+#   defender segment  10.20.2.0/24   defender agent (.10), Langfuse trace sink (.20)
+#   observer segment  10.20.9.0/24   observer harness (.10)
+#   gateway           .2 on every segment; the only router, and the only way to the Internet
+#
+# The segments are *internal macvlan* networks: no Docker bridge, no host leg, no Internet.
+# Whatever crosses between them goes through the gateway's default-drop firewall.
+# Addresses and ports mirror contracts/labcontracts/network.py (a unit test keeps them equal).
+#
+# Start it through labctl.py, which supplies .lab/lab.env.
+name: agentopslab
+
+x-lab-env: &lab-env
+  TARGET_HOSTNAME: target.lab
+  TARGET_IP: 10.20.1.10
+  TARGET_SEGMENT: 10.20.1.0/24
+  DEFENDER_SEGMENT: 10.20.2.0/24
+  OBSERVER_SEGMENT: 10.20.9.0/24
+  OBSERVER_IP: 10.20.9.10
+
+x-hv: &hv
+  build:
+    context: .
+    dockerfile: target/hypervisor/Dockerfile
+  image: agentopslab/target-hypervisor
+  # /dev/net/tun and /dev/kvm are created inside the container when the host offers them
+  device_cgroup_rules:
+    - "c 10:200 rwm"
+    - "c 10:232 rwm"
+
+services:
+  # ------------------------------------------------------------------ A: target
+  target-hv:
+    <<: *hv
+    command: run
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: 1
+      net.ipv4.conf.all.proxy_arp: 1
+      net.ipv4.conf.default.proxy_arp: 1
+    environment:
+      <<: *lab-env
+      LAB_GATEWAY_IP: 10.20.1.2
+      HV_CONTROL_PORT: 8080
+      LAB_HV_TOKEN: ${LAB_HV_TOKEN}
+      TARGET_VCPUS: ${TARGET_VCPUS:-4}
+      TARGET_MEMORY_MB: ${TARGET_MEMORY_MB:-8192}
+    volumes:
+      - target_images:/images
+    networks:
+      target_seg:
+        ipv4_address: 10.20.1.5
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+  # One-shot golden image build. Needs Internet, so it sits on the uplink, not on a segment.
+  target-build:
+    <<: *hv
+    profiles: [build]
+    command: build
+    environment:
+      <<: *lab-env
+      LAB_TARGET_IP: 10.20.1.10
+      LAB_GATEWAY_IP: 10.20.1.2
+      LAB_PROXY_PORT: 3128
+      TARGET_VCPUS: ${TARGET_VCPUS:-4}
+      TARGET_MEMORY_MB: ${TARGET_MEMORY_MB:-8192}
+      TARGET_DISK_GB: ${TARGET_DISK_GB:-40}
+    volumes:
+      - target_images:/images
+      - ./.lab/build:/build-in:ro
+      - ./.lab/build-out:/build-out
+    networks: [uplink]
+
+  # ------------------------------------------------------------------ D: gateway
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    image: agentopslab/gateway
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: 1
+    environment:
+      <<: *lab-env
+      LAB_GATEWAY_TOKEN: ${LAB_GATEWAY_TOKEN}
+      MODEL_PROVIDER_HOSTS: api.anthropic.com
+    volumes:
+      - ./.lab/gateway:/secrets:ro
+      - gateway_data:/var/lib/gateway
+    networks:
+      uplink: {}
+      target_seg:
+        ipv4_address: 10.20.1.2
+      defender_seg:
+        ipv4_address: 10.20.2.2
+      observer_seg:
+        ipv4_address: 10.20.9.2
+    healthcheck:
+      test: ["CMD", "python", "/opt/gateway/healthcheck.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ B: defender
+  defender:
+    build:
+      context: .
+      dockerfile: defender/Dockerfile
+    image: agentopslab/defender
+    cap_add: [NET_ADMIN]          # only to set the default route at start; dropped afterwards
+    environment:
+      <<: *lab-env
+      LAB_GATEWAY_IP: 10.20.2.2
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEFENDER_DRIVER: ${DEFENDER_DRIVER:-sdk}
+      DEFENDER_MODEL_ID: ${DEFENDER_MODEL_ID:-claude-opus-5-5}
+      DEFENDER_CONTROL_PORT: 8090
+      LAB_DEFENDER_TOKEN: ${LAB_DEFENDER_TOKEN}
+      LAB_CONTEXT_SENTINEL: ${LAB_CONTEXT_SENTINEL}
+      LANGFUSE_HOST: http://10.20.2.20:3000
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      HTTPS_PROXY: http://10.20.2.2:3128
+      HTTP_PROXY: http://10.20.2.2:3128
+      NO_PROXY: localhost,127.0.0.1,10.20.1.10,target.lab,10.20.2.20
+    extra_hosts:
+      - "target.lab:10.20.1.10"
+    volumes:
+      - ./.lab/defender:/secrets:ro
+      - defender_state:/state
+    networks:
+      defender_seg:
+        ipv4_address: 10.20.2.10
+    depends_on:
+      gateway: {condition: service_healthy}
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ C: observer
+  observer:
+    build:
+      context: .
+      dockerfile: observer/Dockerfile
+    image: agentopslab/observer
+    cap_add: [NET_ADMIN]          # default route + its own default-deny inbound firewall
+    environment:
+      <<: *lab-env
+      LAB_GATEWAY_IP: 10.20.9.2
+      HV_URL: http://10.20.1.5:8080
+      GATEWAY_URL: http://10.20.9.2:8081
+      DEFENDER_URL: http://10.20.2.10:8090
+      LANGFUSE_URL: http://10.20.2.20:3000
+      LAB_HV_TOKEN: ${LAB_HV_TOKEN}
+      LAB_GATEWAY_TOKEN: ${LAB_GATEWAY_TOKEN}
+      LAB_DEFENDER_TOKEN: ${LAB_DEFENDER_TOKEN}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+    extra_hosts:
+      - "target.lab:10.20.1.10"
+    volumes:
+      - ./.lab/observer:/secrets:ro
+      - observer_data:/data
+    networks:
+      observer_seg:
+        ipv4_address: 10.20.9.10
+    depends_on:
+      gateway: {condition: service_healthy}
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ Langfuse (B's trace sink)
+  # Pinned from langfuse/langfuse v4.81.0 docker-compose.yml. Only langfuse-web has a leg in
+  # the defender segment; its stores live on a private backend network. No published ports.
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4.81.0
+    environment: &langfuse-env
+      NEXTAUTH_URL: http://10.20.2.20:3000
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      HOSTNAME: 0.0.0.0
+      DATABASE_URL: postgresql://postgres:${LANGFUSE_DB_PASSWORD}@langfuse-postgres:5432/postgres
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: 6379
+      REDIS_AUTH: ${LANGFUSE_REDIS_AUTH}
+      LANGFUSE_INIT_ORG_ID: agent-ops-lab
+      LANGFUSE_INIT_ORG_NAME: Agent Ops Lab
+      LANGFUSE_INIT_PROJECT_ID: defender
+      LANGFUSE_INIT_PROJECT_NAME: defender
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: lab@agent-ops-lab.invalid
+      LANGFUSE_INIT_USER_NAME: lab
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+    depends_on: &langfuse-deps
+      langfuse-postgres: {condition: service_healthy}
+      langfuse-minio: {condition: service_healthy}
+      langfuse-redis: {condition: service_healthy}
+      langfuse-clickhouse: {condition: service_healthy}
+    networks:
+      langfuse_backend: {}
+      defender_seg:
+        ipv4_address: 10.20.2.20
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4.81.0
+    environment: *langfuse-env
+    depends_on: *langfuse-deps
+    networks: [langfuse_backend]
+    restart: unless-stopped
+
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:26.3.62.3
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    networks: [langfuse_backend]
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+    restart: unless-stopped
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD}
+    volumes:
+      - langfuse_minio_data:/data
+    networks: [langfuse_backend]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+    restart: unless-stopped
+
+  langfuse-redis:
+    image: docker.io/redis:7
+    command: >
+      --requirepass ${LANGFUSE_REDIS_AUTH}
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    networks: [langfuse_backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  langfuse-postgres:
+    image: docker.io/postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD}
+      POSTGRES_DB: postgres
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    networks: [langfuse_backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+networks:
+  target_seg:
+    driver: macvlan
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.1.0/24
+  defender_seg:
+    driver: macvlan
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.2.0/24
+  observer_seg:
+    driver: macvlan
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.9.0/24
+  uplink: {}                  # gateway's Internet leg; also used by the image build
+  langfuse_backend:
+    internal: true
+
+volumes:
+  target_images:
+  gateway_data:
+  defender_state:
+  observer_data:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

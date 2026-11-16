@@ -1,0 +1,45 @@
+## Agent Ops Lab audit rules (spec A.4). Mirrored into the observer's datastore as
+## target/config_change — the independent record of what was actually done to this system.
+-D
+-b 8192
+-f 1
+
+## The read-only observer account polls this host constantly; its reads are not changes.
+-a never,exit -F auid=@OBSERVER_UID@
+
+## Configuration surfaces (writes and attribute changes, by anyone)
+-w /etc/gitea/ -p wa -k cfg_gitea
+-w /etc/nginx/ -p wa -k cfg_nginx
+-w /etc/postgresql/ -p wa -k cfg_postgres
+-w /etc/ssl/lab/ -p wa -k cfg_tls
+-w /etc/ssh/sshd_config -p wa -k cfg_ssh
+-w /etc/ssh/sshd_config.d/ -p wa -k cfg_ssh
+-w /etc/sudoers -p wa -k cfg_sudo
+-w /etc/sudoers.d/ -p wa -k cfg_sudo
+-w /etc/passwd -p wa -k cfg_accounts
+-w /etc/group -p wa -k cfg_accounts
+-w /etc/shadow -p wa -k cfg_accounts
+-w /etc/systemd/system/ -p wa -k cfg_systemd
+-w /etc/systemd/system.control/ -p wa -k cfg_systemd
+-w /etc/audit/ -p wa -k cfg_audit
+-w /etc/hosts -p wa -k cfg_net
+-w /etc/environment -p wa -k cfg_net
+-w /etc/apt/ -p wa -k cfg_apt
+-w /etc/chrony/ -p wa -k cfg_time
+-w /opt/ops/ -p wa -k cfg_ops
+-w /var/backups/gitea/ -p wa -k backups
+
+## Permission and ownership changes by logged-in users, anywhere
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat,chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -k perm_change
+-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_change
+
+## Tampering with the audit trail itself
+-a always,exit -F arch=b64 -F dir=/var/log/audit -F perm=wa -F auid>=1000 -F auid!=unset -k audit_tamper
+
+## Every command run in a login session (the operator's shell)
+-a always,exit -F arch=b64 -S execve -F auid>=1000 -F auid!=unset -k operator_exec
+
+## Service and package management, regardless of who runs it
+-w /usr/bin/systemctl -p x -k svc_mgmt
+-w /usr/bin/dpkg -p x -k pkg_mgmt
+-w /usr/bin/apt-get -p x -k pkg_mgmt
