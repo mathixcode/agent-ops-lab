@@ -555,9 +555,11 @@ def supporting(truth: GroundTruth) -> dict[str, Any]:
         name = e.payload["check"]
         if name in ("tls", "registration_closed", "anonymous_access_denied", "exposed_ports",
                     "secret_file_permissions", "auditd_active", "installed_versions"):
-            s = security.setdefault(name, {"checks": 0, "failed": 0, "first_failure": None})
+            s = security.setdefault(name, {"checks": 0, "failed": 0, "inconclusive": 0, "first_failure": None})
             s["checks"] += 1
-            if not e.payload["ok"]:
+            if e.payload.get("inconclusive"):
+                s["inconclusive"] += 1
+            elif not e.payload["ok"]:
                 s["failed"] += 1
                 s["first_failure"] = s["first_failure"] or _iso(e.ts)
     return {

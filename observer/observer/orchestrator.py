@@ -278,18 +278,22 @@ class Orchestrator:
             prober.task_checks(self.assigned_tasks)
         except Exception:
             log.exception("final checks failed")
-        # Langfuse ingests asynchronously: keep pulling until two consecutive pulls bring nothing new.
+        # Last pulls. Langfuse ingests asynchronously, so the defender's events are pulled until
+        # two consecutive pulls bring nothing new; the target and gateway logs are read once more
+        # after that.
         quiet, deadline = 0, time.time() + 180
         while quiet < 2 and time.time() < deadline:
-            got = 0
-            for collector in collectors:
+            time.sleep(8)
+            try:
+                quiet = quiet + 1 if not next(c for c in collectors if isinstance(c, LangfuseCollector)).pull() else 0
+            except Exception as exc:
+                log.warning("final pull of the defender's events: %s", str(exc)[:200])
+        for collector in collectors:
+            if not isinstance(collector, LangfuseCollector):
                 try:
-                    res = collector.pull()
-                    got += sum(res.values()) if isinstance(res, dict) else int(res or 0)
+                    collector.pull()
                 except Exception as exc:
                     log.warning("final pull %s: %s", type(collector).__name__, str(exc)[:200])
-            quiet = quiet + 1 if got == 0 else 0
-            time.sleep(10)
         try:
             self.gateway.end_run()
         except requests.RequestException as exc:

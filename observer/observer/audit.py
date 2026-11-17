@@ -18,6 +18,32 @@ _FIELD = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S*)')
 _HEXISH = re.compile(r"^(?:[0-9A-Fa-f]{2})+$")
 SERVICE_TOOLS = {"systemctl", "service", "kill", "pkill", "killall", "reboot", "shutdown", "poweroff"}
 PACKAGE_TOOLS = {"apt", "apt-get", "dpkg", "aptitude", "pip", "pip3"}
+# Looking is not managing: `systemctl is-active` or `dpkg -l` change nothing.
+SERVICE_VERBS = {"start", "stop", "restart", "reload", "try-restart", "reload-or-restart", "try-reload-or-restart",
+                 "enable", "disable", "reenable", "mask", "unmask", "kill", "isolate", "daemon-reload",
+                 "daemon-reexec", "set-property", "edit", "revert", "reset-failed", "reboot", "poweroff", "halt",
+                 "condrestart", "force-reload"}
+PACKAGE_VERBS = {"install", "remove", "purge", "upgrade", "full-upgrade", "dist-upgrade", "autoremove", "reinstall",
+                 "uninstall", "-i", "--install", "-r", "--remove", "-P", "--purge", "--configure"}
+ALWAYS_DISRUPTIVE = {"kill", "pkill", "killall", "reboot", "shutdown", "poweroff"}
+# The kernel reports one rule key per event (the first rule that matched), so a chmod inside a
+# watched directory arrives under the directory's key. The syscall says what really happened.
+PERMISSION_SYSCALLS = {"chmod", "fchmod", "fchmodat", "fchmodat2", "chown", "fchown", "lchown", "fchownat",
+                       "setxattr", "lsetxattr", "fsetxattr", "removexattr", "lremovexattr", "fremovexattr",
+                       # x86_64 numbers, for logs written without the ENRICHED names
+                       "90", "91", "268", "452", "92", "93", "94", "260", "188", "189", "190", "197", "198", "199"}
+
+
+def _command(argv: list[str]) -> tuple[str, list[str]]:
+    """(tool, its arguments), looking through a leading `sudo [options]`."""
+    if not argv:
+        return "", []
+    tool, rest = posixpath.basename(argv[0]), argv[1:]
+    if tool == "sudo":
+        while rest and rest[0].startswith("-"):
+            rest = rest[1:]
+        return _command(rest)
+    return tool, rest
 
 
 def _fields(text: str) -> dict[str, str]:
@@ -40,21 +66,22 @@ def _text(value: str | None) -> str | None:
     return value
 
 
-def _kind(keys: list[str], argv: list[str]) -> str:
+def _kind(keys: list[str], argv: list[str], syscall: str | None = None) -> str:
     if "audit_tamper" in keys or "cfg_audit" in keys:
         return "audit_config"
-    if "perm_change" in keys:
+    if "perm_change" in keys or syscall in PERMISSION_SYSCALLS:
         return "perm_change"
     if any(k.startswith("cfg_") or k == "backups" for k in keys):
         return "file_change"
     if "operator_exec" in keys:
-        tool = posixpath.basename(argv[0]) if argv else ""
-        if tool == "sudo" and len(argv) > 1:
-            rest = [a for a in argv[1:] if not a.startswith("-")]
-            tool = posixpath.basename(rest[0]) if rest else tool
-        if tool in SERVICE_TOOLS:
+        tool, args = _command(argv)
+        if tool in ALWAYS_DISRUPTIVE:
             return "service_mgmt"
-        if tool in PACKAGE_TOOLS:
+        if tool == "systemctl" and SERVICE_VERBS & set(args):
+            return "service_mgmt"
+        if tool == "service" and len(args) >= 2 and args[1] in SERVICE_VERBS:
+            return "service_mgmt"
+        if tool in PACKAGE_TOOLS and PACKAGE_VERBS & set(args):
             return "package_mgmt"
         return "exec"
     return "other"
@@ -110,11 +137,12 @@ def parse(lines: Iterable[str], uid_names: dict[int, str] | None = None) -> Iter
             actor = "system"                    # daemons, cron, hypervisor-injected faults
         else:
             actor = uid_names.get(auid) or _text(syscall.get("AUID")) or f"uid:{auid}"
+        name = syscall.get("SYSCALL") or syscall.get("syscall")
         payload = {
-            "kind": _kind(keys, argv), "keys": keys, "audit_id": gid, "actor": actor,
+            "kind": _kind(keys, argv, name), "keys": keys, "audit_id": gid, "actor": actor,
             "auid": None if auid == UNSET_AUID else auid, "uid": uid,
             "exe": _text(syscall.get("exe")), "comm": _text(syscall.get("comm")),
-            "syscall": syscall.get("SYSCALL") or syscall.get("syscall"),
+            "syscall": name,
             "success": syscall.get("success") == "yes",
             "paths": paths,
         }

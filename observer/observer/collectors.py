@@ -223,7 +223,8 @@ class LangfuseCollector:
     def _observations(self, since: dt.datetime) -> list[dict]:
         """Langfuse v4 observations API (v2): cursor-paginated, span attributes under `metadata`."""
         out: list[dict] = []
-        params = {"fields": "core,metadata", "limit": 500,
+        # Without expandMetadata Langfuse cuts every metadata value to 200 characters.
+        params = {"fields": "core,metadata", "limit": 500, "expandMetadata": "attributes.lab.event.payload",
                   "fromStartTime": since.strftime("%Y-%m-%dT%H:%M:%S.000Z")}
         while True:
             resp = self.session.get(self.base + "/api/public/v2/observations", timeout=60, params=params)

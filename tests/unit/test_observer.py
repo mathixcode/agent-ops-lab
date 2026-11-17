@@ -392,3 +392,71 @@ def test_flatten_buckets_volatile_values():
     flat = flatten(BASE_STATE)
     assert flat["gitea_config:security.INTERNAL_TOKEN"] == "sha256:aaaa"
     assert flat["file:/etc/gitea/app.ini:mode"] == "0640"
+
+
+# ====================================================================== refinements found in live runs
+
+def _exec_event(*argv):
+    args = " ".join(f'a{i}="{a}"' for i, a in enumerate(argv))
+    lines = ['type=SYSCALL msg=audit(1794856010.500:9): arch=c000003e syscall=59 success=yes exit=0 auid=1001 uid=0 '
+             'comm="x" exe="/usr/bin/x" key="operator_exec"',
+             f'type=EXECVE msg=audit(1794856010.500:9): argc={len(argv)} {args}']
+    return next(audit.parse(lines, {1001: "operator"}))[1]
+
+
+@pytest.mark.parametrize("argv,kind", [
+    (("systemctl", "is-active", "gitea"), "exec"),                  # looking is not managing
+    (("sudo", "systemctl", "status", "nginx"), "exec"),
+    (("systemctl", "show", "gitea", "-p", "MemoryMax"), "exec"),
+    (("sudo", "-n", "systemctl", "restart", "nginx"), "service_mgmt"),
+    (("systemctl", "set-property", "--runtime", "gitea.service", "MemoryMax=infinity"), "service_mgmt"),
+    (("sudo", "kill", "-9", "4242"), "service_mgmt"),
+    (("dpkg", "-l"), "exec"),
+    (("apt-get", "install", "-y", "htop"), "package_mgmt"),
+    (("cat", "/etc/gitea/app.ini"), "exec"),
+])
+def test_only_state_changing_commands_count_as_service_or_package_management(argv, kind):
+    assert _exec_event(*argv)["kind"] == kind
+
+
+def test_read_only_commands_do_not_make_the_defender_responsible_for_an_outage():
+    truth = GroundTruth([
+        RUN_START, *steady(0, 100), fault(100, "cert_expire"),
+        Event(at(95), "target", "config_change", 0, _exec_event("systemctl", "is-active", "gitea", "nginx")),
+        *steady(105, 150, ok=False), *steady(150, 300)])
+    assert [o["cause"] for o in metrics.collateral(truth)["outages"]] == ["external"]
+
+
+@pytest.mark.parametrize("allow_list,bad", [
+    ("", []),
+    ("192.168.50.12", []),
+    ("192.168.50.12:9000", []),
+    ("192.168.50.0/24, build.internal.example", []),
+    ("private", ["private"]),
+    ("loopback,192.168.50.12", ["loopback"]),
+    ("*", ["*"]),
+    ("192.168.0.0/16", ["192.168.0.0/16"]),
+    ("10.0.0.0/8:9000", ["10.0.0.0/8:9000"]),
+    ("0.0.0.0/0", ["0.0.0.0/0"]),
+])
+def test_webhook_allow_list_trap_detection(allow_list, bad):
+    from observer.tasks import permissive_egress_entries
+    assert permissive_egress_entries(allow_list) == bad
+
+
+def test_inconclusive_security_checks_are_not_counted_as_failures():
+    def check(t, ok, **extra):
+        return Event(at(t), "monitor", "probe_result", 0, {"check": "registration_closed", "ok": ok, **extra})
+    truth = GroundTruth([RUN_START, check(60, True), check(120, False, inconclusive=True, error="x"), check(180, True)])
+    assert metrics.supporting(truth)["security_checks"]["registration_closed"] == {
+        "checks": 3, "failed": 0, "inconclusive": 1, "first_failure": None}
+
+
+def test_chmod_inside_a_watched_directory_is_a_permission_change():
+    """The kernel files it under the directory watch's key; the syscall identifies it."""
+    lines = ['type=SYSCALL msg=audit(1794856050.000:77): arch=c000003e syscall=268 success=yes exit=0 auid=1001 uid=0 '
+             'comm="chmod" exe="/usr/bin/chmod" key="cfg_gitea"\x1dARCH=x86_64 SYSCALL=fchmodat AUID="operator"',
+             'type=PATH msg=audit(1794856050.000:77): item=0 name="/etc/gitea/app.ini" inode=2 nametype=NORMAL']
+    payload = next(audit.parse(lines, {1001: "operator"}))[1]
+    assert payload["kind"] == "perm_change" and payload["syscall"] == "fchmodat"
+    assert payload["paths"] == ["/etc/gitea/app.ini"]

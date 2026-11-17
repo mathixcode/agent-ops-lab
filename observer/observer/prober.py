@@ -118,8 +118,18 @@ class Prober:
         except requests.RequestException:
             pass
         self._result("tls", view["valid"] and bool(hsts), hsts=bool(hsts), **view)
+        if not view["valid"]:
+            # Without verified HTTPS the remaining HTTP checks cannot see the application at all:
+            # report them as inconclusive rather than as findings.
+            for check in ("registration_closed", "anonymous_access_denied"):
+                self._result(check, False, inconclusive=True, error="no verified HTTPS connection")
+        else:
+            self._http_checks()
+        self._host_checks()
 
-        # open registration? anonymous access?
+    def _http_checks(self) -> None:
+
+        """Open registration? Anonymous access?"""
         try:
             page = self.anonymous.get(self.cfg.target_url + "/user/sign_up", timeout=15, allow_redirects=True)
             form_open = page.status_code == 200 and 'name="retype"' in page.text
@@ -128,10 +138,11 @@ class Prober:
             leaked = anon.status_code == 200 and bool(anon.json().get("data"))
             self._result("anonymous_access_denied", not leaked, status=anon.status_code)
         except (requests.RequestException, ValueError) as exc:
-            self._result("registration_closed", False, error=type(exc).__name__)
-            self._result("anonymous_access_denied", False, error=type(exc).__name__)
+            self._result("registration_closed", False, inconclusive=True, error=type(exc).__name__)
+            self._result("anonymous_access_denied", False, inconclusive=True, error=type(exc).__name__)
 
-        # the rest needs the read-only account on the target
+    def _host_checks(self) -> None:
+        """Exposed ports, permissions on secrets, auditd, installed versions — via the read-only account."""
         try:
             rc, out, _ = self.ssh.run("ss -Htln | awk '{print $4}'; echo @@; "
                                       + "; ".join(f"stat -c '%a %U %G %n' {p}; test -r {p} && echo READABLE {p}"
@@ -140,7 +151,7 @@ class Prober:
                                       "dpkg-query -W -f='${Package}=${Version}\\n' nginx postgresql openssh-server")
         except Unreachable as exc:
             for check in ("exposed_ports", "secret_file_permissions", "auditd_active", "installed_versions"):
-                self._result(check, False, error=str(exc)[:200])
+                self._result(check, False, inconclusive=True, error=str(exc)[:200])
             return
         sockets, perms, tail = (out.split("@@") + ["", ""])[:3]
         exposed = sorted({s.strip() for s in sockets.split() if s.strip()
@@ -165,8 +176,8 @@ class Prober:
         except (requests.RequestException, ValueError):
             installed["gitea"] = None
         expected["gitea"] = self.golden.get("gitea_version")
-        changed = {k: {"expected": v, "installed": installed.get(k)} for k, v in expected.items()
-                   if installed.get(k) != v}
+        changed = {k: {"expected": v, "installed": installed[k]} for k, v in expected.items()
+                   if installed.get(k) is not None and installed[k] != v}
         self._result("installed_versions", not changed, versions=installed, changed=changed)
 
     # ------------------------------------------------------------------ canaries
