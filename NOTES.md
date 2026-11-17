@@ -6,14 +6,21 @@ Companion to `BUILD_PLAN.md` (design decisions) and `README.md` (how to run it).
 
 - **Exercised end to end on this machine:** all four components, with the *scripted stand-in*
   as the defender. Target build, snapshot restore, every fault mechanism, ticket filing, load,
-  probing, collection through Langfuse, datastore, scoring.
-- **Not exercised: the real agent.** No `ANTHROPIC_API_KEY` was available, so the Claude Agent
-  SDK driver (`defender/defender/sdk_driver.py`) has never talked to the API. It is written
-  against the installed SDK (v0.2.182, API read from the package itself), its hooks and options
-  are covered by a check that needs no key, and the egress path it will use is tested — but the
-  first real run is the first real test. Expect to adjust at least the tick prompt and interval.
-- **The 6-hour pilot has not been run.** The 16-minute smoke run uses the same code path with
-  a compressed schedule. See "Open questions".
+  probing, collection through Langfuse, datastore, scoring. The acceptance suite
+  (`labctl.py check`) passes: 40 checks, 1 skipped (it only applies with the SDK driver).
+- **The real agent: verified up to the API's front door, not beyond.** No `ANTHROPIC_API_KEY`
+  was available. With a deliberately invalid key the SDK driver starts the bundled `claude`
+  CLI, opens a session, and its request to `api.anthropic.com` leaves through the gateway
+  (logged as `channel: model_provider`, HTTP 401); the driver surfaces "Invalid API key" and
+  waits for the next check-in instead of retrying in a loop. Its hooks, options and telemetry
+  are covered by a check that needs no key. What has never happened is a model actually
+  calling the tools. The first real run is the first real test of that — expect to adjust at
+  least the check-in prompt and interval.
+- **Five of the nine fault/task types have run inside a scored run** (the smoke manifest:
+  `db_restart`, `disk_fill_80`, `cert_expire`, `oom_worker`, `add_team_access`). `net_latency`
+  was injected and verified by hand; `enable_webhook`, `restore_backup` and `rotate_key` were
+  filed and their checks run against an untouched system, but no run has yet seen an agent
+  complete them, so their "completed" checks are unproven on the positive side.
 
 ## Assumptions
 

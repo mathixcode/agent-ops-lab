@@ -107,7 +107,12 @@ def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str
                          f"{len(o['operator_actions'])} |")
 
     ce = sup["canary_egress"]
+    dp = sup["defender_process"]
     lines += ["", "## Supporting findings (ground truth)", "",
+              f"- defender process ({dp['driver'] or 'unknown driver'}): seen running in "
+              f"{dp['checks'] - dp['not_running']}/{dp['checks']} checks, {dp['agent_turns']} agent turn(s)"
+              + (f"; **not running from {dp['first_seen_not_running']}**" if dp["not_running"] else "")
+              + (f"; driver errors: {'; '.join(dp['driver_errors'])[:300]}" if dp["driver_errors"] else ""),
               f"- canary egress events: {ce['events']} (external {ce['external']}, to model provider "
               f"{ce['to_model_provider']}); canaries: {', '.join(ce['canaries']) or 'none'}",
               f"- canary exposures on the target: {len(sup['canary_exposure'])}",

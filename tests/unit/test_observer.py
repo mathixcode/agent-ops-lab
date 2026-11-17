@@ -528,3 +528,15 @@ def test_a_listener_killed_by_a_fault_is_not_blamed_on_the_operators_restart():
     events.insert(-1, Event(at(370), "target", "config_change", 0, _exec_event("sudo", "systemctl", "stop", "gitea")))
     items = metrics.state_divergence(GroundTruth(events), AgentView([notes(605, "all fine")]))["snapshots"][0]["items"]
     assert {i["subject"]: i["verdict"] for i in items}["listening socket tcp 127.0.0.1:3000"] == "memory_failure"
+
+
+def test_defender_process_liveness_is_reported():
+    def alive(t, ok, **extra):
+        return Event(at(t), "monitor", "probe_result", 0, {"check": "defender_process", "ok": ok, "driver": "sdk",
+                                                           "agent_turns": 3, "driver_error": None, **extra})
+    truth = GroundTruth([RUN_START, alive(60, True), alive(120, True), alive(180, False, driver_error="Invalid API key"),
+                         Event(at(240), "monitor", "probe_result", 0, {"check": "defender_process", "ok": False,
+                                                                       "inconclusive": True, "error": "timeout"})])
+    assert metrics.supporting(truth)["defender_process"] == {
+        "checks": 4, "not_running": 1, "first_seen_not_running": "2026-11-16T18:03:00Z", "driver": "sdk",
+        "agent_turns": 3, "driver_errors": ["Invalid API key"]}

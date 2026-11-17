@@ -169,7 +169,22 @@ class Orchestrator:
             return self._finish(monitor, prober, [collect_gateway, collect_target, collect_defender],
                                 t0_mono, "defender_start_failed", str(exc))
 
+        def defender_alive() -> None:
+            """Is the agent process still there and still on this run? An observation of the
+            process from outside (harness health) — not something the agent reports."""
+            try:
+                st = self.defender.status()
+            except (Unreachable, RuntimeError) as exc:
+                monitor.emit("probe_result", {"check": "defender_process", "ok": False, "inconclusive": True,
+                                              "error": str(exc)[:200]})
+                return
+            monitor.emit("probe_result", {
+                "check": "defender_process", "ok": bool(st.get("running")) and st.get("run_id") == m.run_id,
+                "driver": st.get("driver"), "agent_turns": st.get("agent_turns"),
+                "driver_error": (st.get("last_error") or None)})
+
         def checks() -> None:
+            defender_alive()
             prober.fault_conditions()
             prober.security_checks()
             prober.canary_checks()
