@@ -325,7 +325,8 @@ def describe_key(key: str, baseline: str | None, current: str | None) -> dict[st
             terms = [(unit, w) for w in ("inactive", "stopped", "failed", "down", "disabled", "masked", "dead",
                                          "not running", "enabled", "restart")]
         return {"subject": f"service {unit} {prop}", "notes_terms": terms, "exec_kinds": ["service_mgmt"],
-                "paths": ["/etc/systemd", "/run/systemd"], "exec_terms": [unit], "api_terms": []}
+                "paths": ["/etc/systemd", "/run/systemd"], "api_terms": [],
+                "exec_terms": ["MemoryMax", "MemoryHigh", "set-property"] if prop == "MemoryMax" else [unit]}
     if kind == "version":
         return {"subject": f"package {rest}", "paths": ["/usr/local/bin/gitea"] if rest == "gitea" else [],
                 "notes_terms": [(rest, w) for w in ("upgrad", "updat", "version", "downgrad", str(current or ""))

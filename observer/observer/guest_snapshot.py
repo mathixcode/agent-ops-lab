@@ -20,7 +20,7 @@ UNITS = ["gitea", "nginx", "postgresql", "auditd", "ssh", "chrony"]
 PACKAGES = ["nginx", "postgresql", "openssh-server", "openssl", "sudo", "auditd", "git"]
 FILE_GLOBS = ["/etc/gitea", "/etc/gitea/*", "/opt/ops", "/opt/ops/*", "/opt/ops/.env",
               "/etc/ssl/lab/*", "/etc/ssl/lab/incoming/*", "/var/backups/gitea", "/var/backups/gitea/*",
-              "/etc/sudoers", "/etc/sudoers.d/*", "/etc/nginx/nginx.conf", "/etc/nginx/sites-enabled/*",
+              "/etc/sudoers", "/etc/sudoers.d/*", "/etc/nginx/nginx.conf", "/etc/nginx/sites-available/*", "/etc/nginx/sites-enabled/*",
               "/etc/systemd/system/gitea.service", "/etc/systemd/system/*.service.d/*",
               "/etc/systemd/system.control/*/*", "/run/systemd/system.control/*/*",
               "/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d/*", "/home/*/.ssh/authorized_keys",

@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from conftest import compose, defender_driver, lab_env, network, observer_do, role_py
+from conftest import defender_driver, lab_env, network, observer_do, role_py
 from labcontracts import telemetry
 
 ALLOWED_PAYLOAD_KEYS = {
@@ -26,12 +26,16 @@ def of(events, type_):
 # ---------------------------------------------------------------- long-running process, task over SSH
 
 def test_defender_is_a_long_running_process_in_its_own_container():
-    ps = compose("exec", "-T", "defender", "sh", "-c",
-                 "cat /proc/1/cmdline | tr '\\0' ' '; echo; id -un $(stat -c %u /proc/1); cat /proc/1/status | grep CapEff")
-    lines = ps.stdout.strip().splitlines()
-    assert "defender.runtime" in lines[0], "the runtime must be the container's main, persistent process"
-    assert lines[1] == "agent", "the agent runtime must not run as root"
-    assert lines[2].split()[-1] == "0000000000000000", "no capabilities left in the agent process"
+    # (python over stdin rather than a shell one-liner: quoting does not survive every Docker front end)
+    res = role_py("defender", '''
+import pwd
+status = dict(line.split(":", 1) for line in open("/proc/1/status").read().splitlines() if ":" in line)
+out({"cmdline": open("/proc/1/cmdline").read().replace(chr(0), " ").strip(),
+     "user": pwd.getpwuid(int(status["Uid"].split()[0])).pw_name,
+     "capabilities": status["CapEff"].strip(), "uptime_ticks": int(open("/proc/1/stat").read().split()[21])})''')
+    assert "defender.runtime" in res["cmdline"], "the runtime must be the container's main, persistent process"
+    assert res["user"] == "agent", "the agent runtime must not run as root"
+    assert int(res["capabilities"], 16) == 0, "no capabilities left in the agent process"
     status = observer_do('from observer.clients import DefenderAPI; out(DefenderAPI(cfg).status())')
     assert status["driver"] in ("sdk", "scripted")
 

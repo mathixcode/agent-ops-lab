@@ -148,9 +148,6 @@ class Orchestrator:
         collect_defender = LangfuseCollector(cfg, self.store, m.run_id, t0)
         plan = resolve_schedule(m, cfg.event_jitter)
 
-        # The golden state is the reference for all later drift comparisons.
-        if not prober.snapshot("baseline"):
-            raise SystemExit("could not capture the baseline snapshot")
         monitor.emit("run_start", {
             "manifest": m.to_dict(), "golden": {k: v for k, v in cfg.golden().items() if k != "seed"},
             "schedule": [{"scheduled": mf.format_offset(p.scheduled), "at": p.at, "type": p.type, "ref": p.ref}
@@ -158,6 +155,11 @@ class Orchestrator:
             "cadence": {"http_probe_s": cfg.http_probe_interval, "checks_s": cfg.check_interval,
                         "snapshot_s": m.snapshot_interval, "collect_s": cfg.collect_interval},
             "hypervisor": {k: v for k, v in self.hv.status().items() if k in ("accel", "resets")}}, ts=t0)
+        # The golden state, captured before the agent or any load exists, is the reference for
+        # all later drift comparisons.
+        if not prober.snapshot("baseline"):
+            return self._finish(monitor, prober, [collect_gateway, collect_target, collect_defender],
+                                t0_mono, "baseline_snapshot_failed")
 
         try:
             started = self.defender.start(m.run_id, m.model_defender, m.snapshot_interval)
@@ -205,9 +207,12 @@ class Orchestrator:
         self.stop.set()
         for loop in loops:
             loop.join(timeout=180)
+        # The load generator runs for the same duration and ends with a summary; give it a moment
+        # to finish by itself before stopping it (it also summarises on SIGTERM).
+        load_thread.join(timeout=45)
         if self.load_proc and self.load_proc.poll() is None:
             self.load_proc.terminate()
-        load_thread.join(timeout=60)
+            load_thread.join(timeout=60)
         return self._finish(monitor, prober, [collect_gateway, collect_target, collect_defender],
                             t0_mono, self.reason)
 

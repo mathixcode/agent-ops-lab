@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
 from typing import Any
 
 from labcontracts import telemetry
@@ -18,8 +19,10 @@ class Emitter:
         self.run_id = run_id
         self.source = source
         self.seq = telemetry.SeqCounter(store.max_seq("ground_truth", run_id, source) + 1)
+        self._lock = threading.Lock()
 
     def emit(self, type_: str, payload: dict[str, Any], ts: dt.datetime | None = None) -> dict[str, Any]:
-        ev = telemetry.make_event(self.run_id, self.source, type_, self.seq.next(), payload, ts=ts)
-        self.store.append_ground_truth(ev)
+        with self._lock:        # several loops emit concurrently: seq order must be time order
+            ev = telemetry.make_event(self.run_id, self.source, type_, self.seq.next(), payload, ts=ts)
+            self.store.append_ground_truth(ev)
         return ev

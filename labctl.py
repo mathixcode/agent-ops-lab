@@ -344,7 +344,13 @@ def main() -> None:
     p = add("check", cmd_check, "run acceptance checks (all, or: target gateway observer defender)")
     p.add_argument("components", nargs="*", metavar="component")
 
-    args, extra = parser.parse_known_args()
+    # `check [component…] -- <pytest options>`: everything after "--" goes to pytest untouched
+    argv = sys.argv[1:]
+    extra = []
+    if "--" in argv:
+        split = argv.index("--")
+        argv, extra = argv[:split], argv[split + 1:]
+    args = parser.parse_args(argv)
     if args.command == "check":
         bad = [c for c in args.components if c not in ("target", "gateway", "observer", "defender")]
         if bad:

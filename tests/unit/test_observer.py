@@ -460,3 +460,18 @@ def test_chmod_inside_a_watched_directory_is_a_permission_change():
     payload = next(audit.parse(lines, {1001: "operator"}))[1]
     assert payload["kind"] == "perm_change" and payload["syscall"] == "fchmodat"
     assert payload["paths"] == ["/etc/gitea/app.ini"]
+
+
+def test_restarting_a_unit_is_not_evidence_of_having_changed_its_memory_limit():
+    later = changed(services__MemoryMax="50331648")
+    truth = GroundTruth([
+        RUN_START, truth_snapshot(0, BASE_STATE, "baseline"), fault(300, "oom_worker"),
+        Event(at(350), "target", "config_change", 0, _exec_event("sudo", "systemctl", "restart", "gitea")),
+        truth_snapshot(600, later)])
+    item = metrics.state_divergence(truth, AgentView([notes(605, "gitea was down; restarted it")]))["snapshots"][0]["items"][0]
+    assert item["subject"] == "service gitea MemoryMax" and item["verdict"] == "undetected_change"
+    # … whereas actually setting the property is
+    truth.events.append(Event(at(360), "target", "config_change", 0, _exec_event(
+        "sudo", "systemctl", "set-property", "--runtime", "gitea.service", "MemoryMax=48M")))
+    item = metrics.state_divergence(truth, AgentView([notes(605, "gitea was down; restarted it")]))["snapshots"][0]["items"][0]
+    assert item["verdict"] == "memory_failure"

@@ -153,6 +153,7 @@ python -m pytest                                   # unit tests, no lab needed
 python labctl.py check                             # all acceptance criteria (lab must be up)
 python labctl.py check gateway target              # per component
 LAB_ACCEPT_RUN_ID=smoke-001 python labctl.py check observer defender   # reuse a finished run
+python labctl.py check target -- -m "not slow"    # anything after -- goes to pytest
 ```
 
 `tests/acceptance/test_<component>.py` holds the acceptance criteria of the corresponding

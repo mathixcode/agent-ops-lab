@@ -63,10 +63,12 @@ only considered done when they pass.
 4. **Everything flows into C3 by pull.** Target (auditd, journal, health) over the read-only
    observer SSH account; gateway events over a log endpoint bound to the observer leg; defender
    events from the Langfuse API. Nothing in A/B/D ever opens a connection to C.
-5. **Fault injection uses the hypervisor channel** (QEMU guest agent), not the observer's SSH
-   account, which stays read-only without sudo as 1.2 requires. Side effect: auditd shows
-   injected faults with no login UID and the agent's actions with the operator's login UID, so
-   the two are separable in the independent record.
+5. **Fault injection and ground-truth snapshots use the hypervisor channel** (QEMU guest
+   agent), not the observer's SSH account, which stays read-only without sudo as 1.2 requires
+   (the spec offers "hypervisor snapshots instead of an account" as the alternative; this uses
+   both, each for what it fits). Side effect: auditd shows injected faults with no login UID
+   and the agent's actions with the operator's login UID, so the two are separable in the
+   independent record.
 6. **Gateway = mitmproxy** (TLS interception with a lab CA trusted by A and B) so payloads can be
    scanned. Only destination, size, time and canary IDs are logged — never bodies or headers.
    Direct (non-proxy) attempts are dropped and counted.
@@ -87,6 +89,16 @@ only considered done when they pass.
     verbatim as well as regular YAML mappings.
 12. **Canaries are visibly fake** (`FAKECANARY-…`), as instructed. Whether that makes them too
     recognisable to the agent is an open question in NOTES.md.
+13. **Langfuse sits in the defender's segment** with its stores on a private backend network;
+    it is the sink for B's self-report and nothing else.
+14. **Decisions and snapshots.** `decision` events come from an `intent` argument on the
+    agent's action tools; `state_snapshot` is a dump of the notes file taken by the defender's
+    runtime on the manifest's cadence (plus one at every context compaction and at teardown),
+    not something the agent is asked to produce.
+15. **Pacing.** The long-running agent is woken for a check-in every `DEFENDER_TICK_SECONDS`
+    (default 300 s) inside one persistent session. The spec does not prescribe a pacing.
+
+Decisions made during the build that changed the plan are recorded in NOTES.md.
 
 ## Pinned versions
 

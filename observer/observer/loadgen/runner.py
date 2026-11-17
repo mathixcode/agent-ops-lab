@@ -17,6 +17,7 @@ import json  # noqa: E402
 import os  # noqa: E402
 import random  # noqa: E402
 import shutil  # noqa: E402
+import signal  # noqa: E402
 import subprocess  # noqa: E402
 import sys  # noqa: E402
 import tempfile  # noqa: E402
@@ -163,8 +164,10 @@ def main() -> None:
 
     index = 0
     next_stats = args.stats_interval
+    stopping = []
+    gevent.signal_handler(signal.SIGTERM, lambda: stopping.append(True))
     try:
-        while True:
+        while not stopping:
             elapsed = time.time() - started
             if elapsed >= args.duration:
                 break
