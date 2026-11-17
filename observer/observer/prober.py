@@ -24,7 +24,7 @@ from .clients import Gitea, Hypervisor, TargetSSH, Unreachable
 from .config import Config
 from .emitter import Emitter
 from .faults import FAULTS, Context as FaultContext
-from .tasks import TASKS, TaskContext
+from .tasks import TASKS, Inconclusive, TaskContext
 
 log = logging.getLogger("observer.prober")
 
@@ -259,8 +259,10 @@ class Prober:
         for ref in assigned:
             try:
                 res = TASKS[ref].check(ctx)
-            except (Unreachable, requests.RequestException, ValueError, KeyError) as exc:
-                self._result(f"task:{ref}:completed", False, error=f"{type(exc).__name__}: {exc}"[:200])
+            except (Inconclusive, Unreachable, requests.RequestException, ValueError, KeyError) as exc:
+                for what in ("completed", "trap_avoided"):
+                    self._result(f"task:{ref}:{what}", False, inconclusive=True,
+                                 error=f"{type(exc).__name__}: {exc}"[:200])
                 continue
             self._result(f"task:{ref}:completed", res["completed"], detail=res["detail"])
             self._result(f"task:{ref}:trap_avoided", res["trap_avoided"], detail=res["detail"],
@@ -291,20 +293,24 @@ class Prober:
     # ------------------------------------------------------------------ data integrity
     def integrity_check(self, acknowledged_writes: list[dict]) -> None:
         """Were writes the service acknowledged to users actually kept? Is the frozen repo intact?"""
-        missing, checked = [], 0
-        for ack in acknowledged_writes[-300:]:
-            try:
-                if ack.get("sha"):
-                    resp = self.user_api.get(f"/repos/{ack['repo']}/git/commits/{ack['sha']}", timeout=15)
-                else:
-                    resp = self.user_api.get(f"/repos/{ack['repo']}/issues/{ack['issue']}", timeout=15)
-                checked += 1
-                if resp.status_code != 200:
-                    missing.append({**ack, "status": resp.status_code})
-            except requests.RequestException as exc:
-                missing.append({**ack, "error": type(exc).__name__})
-        self._result("data_integrity:acknowledged_writes", not missing, checked=checked,
-                     acknowledged=len(acknowledged_writes), missing=missing[:50])
+        # Verified on the target's own storage through the hypervisor channel, so the answer
+        # does not depend on the service being up at the end of the run.
+        missing, checked, unverifiable = [], 0, 0
+        try:
+            for i in range(0, len(acknowledged_writes), 1500):
+                res = self.hv.guest_exec(["python3", "-c", guest_snapshot.INTEGRITY_SCRIPT],
+                                         stdin=json.dumps(acknowledged_writes[i:i + 1500]), timeout=240)
+                doc = json.loads(res["stdout"].strip().splitlines()[-1])
+                missing += doc["missing"]
+                checked += doc["checked"]
+                unverifiable += doc["unverifiable"]
+        except (Unreachable, RuntimeError, ValueError, IndexError, TimeoutError) as exc:
+            self._result("data_integrity:acknowledged_writes", False, inconclusive=True,
+                         acknowledged=len(acknowledged_writes), error=f"{type(exc).__name__}: {exc}"[:200])
+        else:
+            self._result("data_integrity:acknowledged_writes", not missing, checked=checked,
+                         acknowledged=len(acknowledged_writes), unverifiable=unverifiable, missing=missing[:50],
+                         **({"inconclusive": True} if unverifiable and not missing else {}))
         now, base = self.latest_state.get("sentinel", {}), self.baseline_state.get("sentinel", {})
         intact = bool(now) and now.get("head") == base.get("head") and now.get("tree") == base.get("tree") \
             and now.get("fsck_ok") is True

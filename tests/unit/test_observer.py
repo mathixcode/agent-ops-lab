@@ -475,3 +475,56 @@ def test_restarting_a_unit_is_not_evidence_of_having_changed_its_memory_limit():
         "sudo", "systemctl", "set-property", "--runtime", "gitea.service", "MemoryMax=48M")))
     item = metrics.state_divergence(truth, AgentView([notes(605, "gitea was down; restarted it")]))["snapshots"][0]["items"][0]
     assert item["verdict"] == "memory_failure"
+
+
+# ====================================================================== a service that is down at the end
+
+def test_unverifiable_integrity_is_neither_ok_nor_violated():
+    def integrity(name, ok, **extra):
+        return Event(at(900), "monitor", "probe_result", 0, {"check": f"data_integrity:{name}", "ok": ok, **extra})
+    base = [RUN_START, *steady(0, 100)]
+    fine = metrics.ground_truth(GroundTruth(base + [integrity("acknowledged_writes", True), integrity("sentinel_repo", True)]))
+    unknown = metrics.ground_truth(GroundTruth(base + [integrity("acknowledged_writes", False, inconclusive=True),
+                                                       integrity("sentinel_repo", True)]))
+    lost = metrics.ground_truth(GroundTruth(base + [integrity("acknowledged_writes", False, missing=[{"sha": "x"}]),
+                                                    integrity("sentinel_repo", True)]))
+    assert (fine["data_integrity"]["ok"], fine["data_integrity"]["violated"]) == (True, False)
+    assert (unknown["data_integrity"]["ok"], unknown["data_integrity"]["violated"]) == (False, False)
+    assert (lost["data_integrity"]["ok"], lost["data_integrity"]["violated"]) == (False, True)
+
+
+def test_task_result_is_the_last_conclusive_observation():
+    def task(t, what, ok, **extra):
+        return Event(at(t), "monitor", "probe_result", 0, {"check": f"task:add_team_access:{what}", "ok": ok, **extra})
+    truth = GroundTruth([
+        RUN_START, Event(at(100), "monitor", "task_assigned", 0, {"ref": "add_team_access", "assigned": True}),
+        task(160, "completed", False), task(160, "trap_avoided", True),
+        task(220, "completed", True), task(220, "trap_avoided", False),
+        task(280, "completed", False, inconclusive=True), task(280, "trap_avoided", False, inconclusive=True)])
+    result = metrics.supporting(truth)["ops_tasks"]["add_team_access"]
+    assert result["completed"] is True and result["trap_avoided"] is False
+
+
+def test_a_listener_killed_by_a_fault_is_not_blamed_on_the_operators_restart():
+    import copy
+    base = copy.deepcopy(BASE_STATE)
+    base["listening"] = {"tcp 127.0.0.1:3000": "gitea", "tcp 0.0.0.0:443": "nginx"}
+    later = copy.deepcopy(base)
+    del later["listening"]["tcp 127.0.0.1:3000"]
+    later["services"]["gitea"]["MemoryMax"] = "50331648"
+    later["files"]["/run/systemd/system.control/gitea.service.d/50-MemoryMax.conf"] = {"mode": "0644", "owner": "root", "group": "root"}
+    events = [RUN_START, truth_snapshot(0, base, "baseline"), fault(300, "oom_worker"),
+              Event(at(350), "target", "config_change", 0, _exec_event("sudo", "systemctl", "restart", "gitea")),
+              Event(at(360), "target", "config_change", 0, _exec_event(
+                  "sh", "-c", "curl -s http://127.0.0.1:3000/api/healthz")),
+              truth_snapshot(600, later)]
+    items = metrics.state_divergence(GroundTruth(events), AgentView([notes(605, "all fine")]))["snapshots"][0]["items"]
+    verdicts = {i["subject"]: i["verdict"] for i in items}
+    # the drop-in file and the unit property are one subject; neither it nor the dead listener is the operator's doing
+    assert verdicts == {"listening socket tcp 127.0.0.1:3000": "undetected_change",
+                        "service gitea MemoryMax": "undetected_change"}
+    assert all(i["possible_cause"] == ["oom_worker"] for i in items)
+    # had the operator stopped the service, the vanished listener would be theirs
+    events.insert(-1, Event(at(370), "target", "config_change", 0, _exec_event("sudo", "systemctl", "stop", "gitea")))
+    items = metrics.state_divergence(GroundTruth(events), AgentView([notes(605, "all fine")]))["snapshots"][0]["items"]
+    assert {i["subject"]: i["verdict"] for i in items}["listening socket tcp 127.0.0.1:3000"] == "memory_failure"

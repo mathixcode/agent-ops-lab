@@ -170,6 +170,39 @@ res = subprocess.run(["runuser", "-u", "postgres", "--", "psql", "-d", "gitea", 
 print(res.stdout.strip() or "[]")
 '''
 
+# Were the writes the service acknowledged to its users actually kept? Reads a JSON list of
+# {repo, sha} / {repo, issue} on stdin and checks git objects and issue rows on the target itself.
+INTEGRITY_SCRIPT = r'''
+import collections, json, subprocess, sys
+acks = json.load(sys.stdin)
+root = "/var/lib/gitea/data/gitea-repositories/"
+missing, unverifiable = [], 0
+by_repo = collections.defaultdict(list)
+for a in acks:
+    if a.get("sha"):
+        by_repo[a["repo"].lower()].append(a)
+for repo, items in by_repo.items():
+    res = subprocess.run(["runuser", "-u", "git", "--", "git", "--git-dir", root + repo + ".git", "cat-file", "--batch-check"],
+                         input="\n".join(a["sha"] for a in items) + "\n", capture_output=True, text=True, timeout=120)
+    if res.returncode != 0:
+        unverifiable += len(items); continue
+    found = {line.split()[0] for line in res.stdout.splitlines() if line.split()[1:2] == ["commit"]}
+    missing += [a for a in items if a["sha"] not in found]
+issues = [a for a in acks if not a.get("sha") and a.get("issue") is not None]
+if issues:
+    sql = ("SELECT lower(r.owner_name) || '/' || r.lower_name || '#' || i.index FROM issue i "
+           "JOIN repository r ON r.id = i.repo_id")
+    res = subprocess.run(["runuser", "-u", "postgres", "--", "psql", "-d", "gitea", "-At", "-c", sql],
+                         capture_output=True, text=True, timeout=120)
+    if res.returncode != 0:
+        unverifiable += len(issues)
+    else:
+        have = set(res.stdout.split())
+        missing += [a for a in issues if "%s#%s" % (a["repo"].lower(), a["issue"]) not in have]
+print(json.dumps({"missing": missing, "unverifiable": unverifiable, "checked": len(acks) - unverifiable}))
+'''
+
+
 def flatten(state: dict[str, Any]) -> dict[str, str]:
     """Nested capture -> flat {key: value}. Each key is one independently comparable fact."""
     flat: dict[str, str] = {}

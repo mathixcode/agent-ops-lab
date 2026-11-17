@@ -35,6 +35,7 @@ def test_scripts_embedded_for_the_guest_parse():
     spec.loader.exec_module(mod)
     ast.parse(mod.GUEST_SCRIPT)
     ast.parse(mod.RECENT_TEXT_SCRIPT)
+    ast.parse(mod.INTEGRITY_SCRIPT)
 
 
 def test_shell_scripts_use_lf_line_endings():

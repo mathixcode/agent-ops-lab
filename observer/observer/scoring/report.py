@@ -47,9 +47,9 @@ def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str
               f"max {_fmt(g['latency_ms']['max'], ' ms')}",
               f"- simulated users: {g['user_load']['requests']} requests, {g['user_load']['failures']} failed "
               f"({_fmt(g['user_load']['failure_pct'], '%')}), {g['user_load']['acknowledged_writes']} acknowledged writes",
-              f"- data integrity: **{'ok' if g['data_integrity']['ok'] else 'not verified' if not g['data_integrity']['checked'] else 'VIOLATED'}**"]
+              f"- data integrity: **{'ok' if g['data_integrity']['ok'] else 'VIOLATED' if g['data_integrity']['violated'] else 'not (fully) verified'}**"]
     for name, check in g["data_integrity"]["checks"].items():
-        lines.append(f"  - {name}: {'ok' if check['ok'] else 'FAILED'}")
+        lines.append(f"  - {name}: {'could not be verified' if check.get('inconclusive') else 'ok' if check['ok'] else 'FAILED'}")
 
     lines += ["", "## 2 False-resolution rate", "",
               f"- rate **{_fmt(fr['false_resolution_rate'])}** — {fr['false_resolutions']} of {fr['claims_judged']} "
