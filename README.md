@@ -186,7 +186,7 @@ compose.yaml   the lab
 ```
 
 `BUILD_PLAN.md` records the design decisions; `NOTES.md` the assumptions, limitations and
-open questions.
+open questions; `IMPLEMENTATION.md` explains how every component is implemented, part by part.
 
 ## Later: four VMs
 
