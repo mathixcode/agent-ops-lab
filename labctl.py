@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""labctl — host-side control for the Agent Ops Lab local pilot.
+"""labctl — host-side control for the Agent Ops Lab pilot (one Docker host).
 
 Run it with the project's virtualenv interpreter:
 
+    .venv/bin/python labctl.py <command>              (Linux, including a remote VM over SSH)
     .venv/Scripts/python.exe labctl.py <command>      (Windows)
-    .venv/bin/python labctl.py <command>              (Linux/macOS)
 
-Docker is used directly when it is on PATH and through WSL otherwise.
+Docker is used directly when `docker` is on PATH (the normal case on Linux). Only when it is
+not, and `wsl.exe` exists (Windows), is Docker reached through WSL.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import datetime as dt
 import ipaddress
 import json
 import os
+import platform
 import secrets
 import shutil
 import subprocess
@@ -27,8 +29,60 @@ sys.path.insert(0, str(ROOT / "contracts"))
 
 from labcontracts import canary, network  # noqa: E402
 
+CREDENTIAL_VARS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+OVERLAY_KVM = "compose.kvm.yaml"
+OVERLAY_LANGFUSE_UI = "compose.langfuse-ui.yaml"
+TRUE = ("1", "true", "yes", "on")
+
+# Host sizing for the full stack (target VM + gateway + defender + observer/load + Langfuse with
+# ClickHouse/Postgres/Redis/MinIO). README "Host sizing" explains the numbers.
+MIN_CPUS, REC_CPUS = 6, 8
+MIN_MEM_GIB, REC_MEM_GIB = 16, 32
+MIN_DISK_GIB = 60
+
+
+# --------------------------------------------------------------------------- settings (.env)
+
+def read_dotenv(path: Path | None = None) -> dict[str, str]:
+    """KEY=VALUE lines of .env (git-ignored). Quotes around a value are removed."""
+    path = path or ROOT / ".env"
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def settings() -> dict[str, str]:
+    """.env, overridden by the process environment (the same precedence Compose uses)."""
+    merged = read_dotenv()
+    merged.update({k: v for k, v in os.environ.items() if k in merged or k.startswith(("LAB_", "DEFENDER_",
+                   "TARGET_", "LANGFUSE_UI")) or k in CREDENTIAL_VARS})
+    return merged
+
+
+def defender_auth(env: dict[str, str]) -> str:
+    """"api_key", "oauth", "none" or "conflict" (both set) — mirrors defender/runtime.py."""
+    key, oauth = bool(env.get("ANTHROPIC_API_KEY")), bool(env.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    if key and oauth:
+        return "conflict"
+    return "oauth" if oauth else "api_key" if key else "none"
+
 
 # --------------------------------------------------------------------------- docker plumbing
+
+def using_wsl() -> bool:
+    return not shutil.which("docker") and bool(shutil.which("wsl.exe"))
+
 
 def docker_prefix() -> list[str]:
     if shutil.which("docker"):
@@ -36,24 +90,74 @@ def docker_prefix() -> list[str]:
     if shutil.which("wsl.exe"):
         distro = os.environ.get("LAB_WSL_DISTRO")
         return ["wsl.exe", *(["-d", distro] if distro else []), "--", "docker"]
-    sys.exit("labctl: neither docker nor wsl.exe found on PATH")
+    sys.exit("labctl: `docker` is not on PATH. On a fresh Debian/Ubuntu host run "
+             "`sudo scripts/host-setup.sh` first (installs Docker Engine and the Compose plugin).")
+
+
+def host_run(script: str, timeout: float = 120) -> subprocess.CompletedProcess:
+    """Run a shell script on the Docker host (this machine, or the WSL distro). The script goes
+    in on stdin: wsl.exe mangles multi-line command-line arguments."""
+    prefix = docker_prefix()
+    cmd = ["sh", "-s"] if prefix == ["docker"] else [*prefix[:-1], "sh", "-s"]
+    # bytes, not text: on Windows, text-mode stdin would turn every LF into CRLF
+    res = subprocess.run(cmd, input=script.encode(), capture_output=True, timeout=timeout)
+    return subprocess.CompletedProcess(res.args, res.returncode, res.stdout.decode(errors="replace"),
+                                       res.stderr.decode(errors="replace"))
+
+
+def kvm_disabled() -> bool:
+    return settings().get("LAB_KVM", "").lower() in ("0", "false", "no", "off")
+
+
+def host_has_kvm() -> bool:
+    try:
+        return host_run("test -c /dev/kvm").returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def docker_env() -> dict[str, str]:
+    """Environment for docker/compose: .env values (shell wins) plus the credential rule.
+
+    Exactly one model credential reaches Compose. With CLAUDE_CODE_OAUTH_TOKEN the API key is
+    removed, so the defender container has no ANTHROPIC_API_KEY at all and cannot fall back to
+    API billing (compose.yaml passes both through without a default, which leaves an absent
+    variable unset). If both are set, neither is passed and `up` refuses to start."""
     env = dict(os.environ)
-    forward = [v for v in ("ANTHROPIC_API_KEY", "DEFENDER_DRIVER", "DEFENDER_MODEL_ID", "TARGET_VCPUS",
-                           "TARGET_MEMORY_MB", "TARGET_DISK_GB") if env.get(v)]
-    if forward and not shutil.which("docker"):
-        # make these visible to `docker compose` inside WSL
-        env["WSLENV"] = ":".join(filter(None, [env.get("WSLENV"), *(f"{v}/u" for v in forward)]))
+    for key, value in read_dotenv().items():
+        env.setdefault(key, value)
+    auth = defender_auth(env)
+    drop = {"oauth": ["ANTHROPIC_API_KEY"], "api_key": ["CLAUDE_CODE_OAUTH_TOKEN"],
+            "none": list(CREDENTIAL_VARS), "conflict": list(CREDENTIAL_VARS)}[auth]
+    for var in drop:
+        env.pop(var, None)
+    if using_wsl():
+        # make the lab settings visible to `docker compose` inside WSL
+        forward = sorted({*read_dotenv(), *CREDENTIAL_VARS, "LAB_KVM", "LAB_LANGFUSE_UI", "LANGFUSE_UI_PORT"}
+                         & {k for k, v in env.items() if v})
+        env["WSLENV"] = ":".join(filter(None, [os.environ.get("WSLENV"), *(f"{v}/u" for v in forward)]))
     return env
 
 
+_KVM: bool | None = None
+
+
+def compose_files() -> list[str]:
+    """compose.yaml plus the overlays that apply on this host."""
+    global _KVM
+    if _KVM is None:
+        _KVM = not kvm_disabled() and host_has_kvm()
+    files = ["compose.yaml"]
+    if _KVM:
+        files.append(OVERLAY_KVM)
+    if settings().get("LAB_LANGFUSE_UI", "").lower() in TRUE:
+        files.append(OVERLAY_LANGFUSE_UI)
+    return files
+
+
 def compose_cmd(*args: str) -> list[str]:
-    cmd = [*docker_prefix(), "compose", "--env-file", ".lab/lab.env"]
-    if (ROOT / ".env").exists():
-        cmd += ["--env-file", ".env"]
-    return [*cmd, *args]
+    files = [x for f in compose_files() for x in ("-f", f)]
+    return [*docker_prefix(), "compose", *files, "--env-file", ".lab/lab.env", *args]
 
 
 def run(cmd: list[str], check: bool = True, **kw) -> subprocess.CompletedProcess:
@@ -234,14 +338,209 @@ def cmd_distribute(_args: argparse.Namespace | None = None) -> None:
 
 # --------------------------------------------------------------------------- lifecycle
 
+HOST_PROBE = r"""
+echo "kernel=$(uname -r)"
+echo "arch=$(uname -m)"
+( . /etc/os-release 2>/dev/null && echo "os=$PRETTY_NAME" ) || echo "os=unknown"
+[ -c /dev/net/tun ] && echo tun=present || echo tun=missing
+[ -c /dev/kvm ] && echo kvm=present || echo kvm=missing
+echo "cpu_virt_flags=$(grep -c -E '(vmx|svm)' /proc/cpuinfo 2>/dev/null || echo 0)"
+mod_state() {
+    if [ -d "/sys/module/$1" ]; then echo loaded
+    elif grep -qs "/$1.ko" "/lib/modules/$(uname -r)/modules.builtin"; then echo built-in
+    elif find "/lib/modules/$(uname -r)" -name "$1.ko*" 2>/dev/null | grep -q .; then echo loadable
+    else echo unknown; fi
+}
+echo "mod_nf_tables=$(mod_state nf_tables)"
+cfg=$( (zcat /proc/config.gz 2>/dev/null || cat "/boot/config-$(uname -r)" 2>/dev/null) | grep -E '^CONFIG_NF_TABLES=')
+echo "cfg_nf_tables=${cfg#CONFIG_NF_TABLES=}"
+"""
+
+# Runs inside the hypervisor container: which accelerator the running QEMU was started with.
+QEMU_ACCEL = r"""import glob
+for f in glob.glob('/proc/[0-9]*/cmdline'):
+    try:
+        a = open(f, 'rb').read().split(b'\0')
+    except OSError:
+        continue
+    if a and a[0].endswith(b'qemu-system-x86_64') and b'-accel' in a:
+        print(a[a.index(b'-accel') + 1].decode().split(',')[0])
+        break
+else:
+    print('no-vm')
+"""
+
+
+def parse_kv(text: str) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def assess_resources(cpus: int, mem_bytes: int, disk_free_bytes: int | None) -> list[tuple[str, str, str]]:
+    """Host sizing verdicts for the full stack (see MIN_*/REC_* above)."""
+    gib = 1024 ** 3
+    mem = mem_bytes / gib
+    out = []
+    if cpus < MIN_CPUS:
+        out.append(("WARN", "cpus", f"{cpus} - below the minimum of {MIN_CPUS}; lower TARGET_VCPUS, expect slow runs"))
+    else:
+        out.append(("ok" if cpus >= REC_CPUS else "WARN", "cpus",
+                    f"{cpus}" + ("" if cpus >= REC_CPUS else f" - works; {REC_CPUS}+ recommended")))
+    if mem < MIN_MEM_GIB - 1:      # MemTotal is a little under the nominal size
+        out.append(("WARN", "memory", f"{mem:.1f} GiB - below the minimum of {MIN_MEM_GIB} GiB; set "
+                                      "TARGET_MEMORY_MB=4096 or less (Langfuse alone needs ~4 GiB)"))
+    else:
+        out.append(("ok" if mem >= REC_MEM_GIB - 2 else "WARN", "memory",
+                    f"{mem:.1f} GiB" + ("" if mem >= REC_MEM_GIB - 2 else
+                                         f" - works with TARGET_MEMORY_MB=4096; {REC_MEM_GIB} GiB recommended")))
+    if disk_free_bytes is None:
+        out.append(("WARN", "disk", "free space of Docker's data directory could not be determined"))
+    else:
+        free = disk_free_bytes / gib
+        out.append(("ok" if free >= MIN_DISK_GIB else "WARN", "disk",
+                    f"{free:.0f} GiB free for Docker" + ("" if free >= MIN_DISK_GIB else
+                                                         f" - {MIN_DISK_GIB}+ GiB recommended (images, VM disks, traces)")))
+    return out
+
+
+def nft_functional(prefix: list[str], env: dict[str, str]) -> bool | None:
+    """Can a container program nftables? Tried with the gateway image if it is built (it ships
+    `nft`); None if there is no image to try with yet."""
+    image = "agentopslab/gateway"
+    if subprocess.run([*prefix, "image", "inspect", image], capture_output=True, env=env).returncode != 0:
+        return None
+    res = subprocess.run([*prefix, "run", "--rm", "--network", "none", "--cap-add", "NET_ADMIN",
+                          "--entrypoint", "nft", image, "list", "tables"], capture_output=True, env=env)
+    return res.returncode == 0
+
+
+def nftables_verdict(module: str, config: str, functional: bool | None) -> tuple[str, str, str]:
+    if functional is True:
+        return "ok", "nftables", "a container can program nftables (tested with the gateway image)"
+    if functional is False:
+        return "FAIL", "nftables", ("a container cannot program nftables - the gateway, hypervisor and observer "
+                                    "firewalls need it (`sudo modprobe nf_tables`)")
+    if module in ("loaded", "built-in", "loadable") or config in ("y", "m"):
+        return "ok", "nftables", f"nf_tables kernel support present ({module if module != 'unknown' else 'config=' + config})"
+    return "WARN", "nftables", ("could not determine nf_tables support; it is tested for real once the images are "
+                                "built (run doctor again after `labctl.py build --images-only`)")
+
+
+def kvm_verdict(host_kvm: bool, disabled: bool, cpu_flags: int, active: str | None) -> tuple[str, str]:
+    """`active`: accelerator of the running target VM ("kvm"/"tcg"), "no-vm", or None (lab not up)."""
+    slow = ("the target VM runs under TCG software emulation - a full VM, but several times slower "
+            "(boot, API calls and probes take much longer; latency numbers are not comparable with KVM runs). "
+            "Fine for smoke tests; long-horizon runs want a KVM-capable host, such as a dedicated/bare-metal "
+            "server (e.g. a Hetzner dedicated server) or a VM type that exposes nested virtualisation")
+    if active == "kvm":
+        return "ok", "ACTIVE - the running target VM uses KVM"
+    if active == "tcg":
+        why = ("disabled by LAB_KVM=0" if disabled else
+               "the VM was started without /dev/kvm; run `labctl.py up` again" if host_kvm else
+               "/dev/kvm is missing on this host")
+        return "WARN", f"NOT active ({why}): {slow}"
+    if disabled:
+        return "WARN", f"disabled by LAB_KVM=0: {slow}"
+    if host_kvm:
+        return "ok", "available (/dev/kvm) - the target VM will use KVM" + (
+            "" if active is None else " (target VM not running right now)")
+    hint = (" The CPU advertises vmx/svm: load the module (`sudo modprobe kvm_intel` or `kvm_amd`)."
+            if cpu_flags else "")
+    return "WARN", f"not available (no /dev/kvm): {slow}.{hint}"
+
+
 def cmd_doctor(_args: argparse.Namespace) -> None:
-    probe = ("set -e; docker info --format 'docker {{.ServerVersion}}, {{.NCPU}} cpus, "
-             "{{.MemTotal}} bytes'; docker compose version --short; "
-             "test -c /dev/net/tun && echo tun:ok || echo tun:MISSING; "
-             "test -e /dev/kvm && echo kvm:yes || echo 'kvm:no (target VM will use slow TCG emulation)'")
+    """Report, item by item, whether this host can run the lab. Exit 1 if anything is FAIL."""
+    rows: list[tuple[str, str, str]] = []
+
+    def add(status: str, item: str, detail: str) -> None:
+        rows.append((status, item, detail))
+        print(f"[{status:^4}] {item:<15} {detail}", flush=True)
+
+    add("ok", "host", f"{platform.system()} {platform.release()}; docker reached "
+        + ("through WSL (docker not on PATH)" if using_wsl() else "directly (on PATH)"))
+    py_ok = sys.version_info >= (3, 10)
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    missing = []
+    for mod in ("yaml", "cryptography", "pytest", "requests", "paramiko", "jsonschema"):
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(mod)
+    add("FAIL" if not py_ok or missing else "ok" if in_venv else "WARN", "python",
+        f"{platform.python_version()} at {sys.executable}"
+        + ("" if in_venv else " - not a virtualenv; use .venv/bin/python")
+        + (f"; missing {', '.join(missing)}: pip install -r requirements-dev.txt" if missing else ""))
+
     prefix = docker_prefix()
-    shell = ["sh", "-c", probe] if prefix == ["docker"] else [*prefix[:-1], "sh", "-c", probe]
-    run(shell)
+    env = docker_env()
+    info = subprocess.run([*prefix, "info", "--format", "{{json .}}"], capture_output=True, text=True, env=env)
+    if info.returncode != 0:
+        add("FAIL", "docker engine", ((info.stderr or "").strip().splitlines() or ["not reachable"])[-1]
+            + " - is the daemon running, and is your user in the `docker` group?")
+        sys.exit(1)
+    d = json.loads(info.stdout)
+    add("ok", "docker engine", f"{d.get('ServerVersion')} on {d.get('OperatingSystem')}, cgroup v{d.get('CgroupVersion')}")
+    cv = subprocess.run([*prefix, "compose", "version", "--short"], capture_output=True, text=True, env=env)
+    version = cv.stdout.strip().lstrip("v")
+    major_ok = cv.returncode == 0 and version.split(".")[0].isdigit() and int(version.split(".")[0]) >= 2
+    add("ok" if major_ok else "FAIL", "compose plugin", version or "missing - install docker-compose-plugin")
+
+    host = parse_kv(host_run(HOST_PROBE).stdout)
+    arch = host.get("arch", "?")
+    add("ok" if arch in ("x86_64", "amd64") else "WARN", "architecture",
+        arch + ("" if arch in ("x86_64", "amd64") else " - the target is an x86_64 VM: emulation only, no KVM"))
+    add("ok", "kernel", f"{host.get('kernel', '?')} ({host.get('os', '?')})")
+    add("ok" if host.get("tun") == "present" else "FAIL", "/dev/net/tun",
+        "present" if host.get("tun") == "present" else "missing - `sudo modprobe tun` (the target VM's NIC needs it)")
+
+    probe_net = "agentopslab-doctor-probe"
+    subprocess.run([*prefix, "network", "rm", probe_net], capture_output=True, env=env)
+    mv = subprocess.run([*prefix, "network", "create", "--driver", "macvlan", "--internal", probe_net],
+                        capture_output=True, text=True, env=env)
+    subprocess.run([*prefix, "network", "rm", probe_net], capture_output=True, env=env)
+    add("ok" if mv.returncode == 0 else "FAIL", "macvlan",
+        "an internal macvlan network can be created" if mv.returncode == 0
+        else f"cannot create an internal macvlan network: {mv.stderr.strip()[-200:]} - `sudo modprobe macvlan`")
+    add(*nftables_verdict(host.get("mod_nf_tables", "unknown"), host.get("cfg_nf_tables", ""),
+                          nft_functional(prefix, env)))
+
+    disk_free = None
+    root_dir = d.get("DockerRootDir") or "/var/lib/docker"
+    df = host_run(f"df -Pk '{root_dir}' 2>/dev/null | tail -1 | awk '{{print $4}}'")
+    if df.stdout.strip().isdigit():
+        disk_free = int(df.stdout.strip()) * 1024
+    for row in assess_resources(int(d.get("NCPU") or 0), int(d.get("MemTotal") or 0), disk_free):
+        add(*row)
+
+    cfg = settings()
+    disabled = kvm_disabled()
+    active = None
+    if (LAB / "lab.env").exists():
+        ps = subprocess.run(compose_cmd("ps", "--status", "running", "--services"), cwd=ROOT,
+                            capture_output=True, text=True, env=env)
+        if "target-hv" in ps.stdout.split():
+            acc = subprocess.run(compose_cmd("exec", "-T", "target-hv", "python3", "-"), input=QEMU_ACCEL,
+                                 cwd=ROOT, capture_output=True, text=True, env=env)
+            active = acc.stdout.strip() or None
+    status, detail = kvm_verdict(host.get("kvm") == "present", disabled, int(host.get("cpu_virt_flags") or 0), active)
+    add(status, "kvm", detail)
+
+    driver = cfg.get("DEFENDER_DRIVER", "sdk")
+    auth = defender_auth(cfg)
+    if driver == "scripted":
+        add("ok", "defender auth", "DEFENDER_DRIVER=scripted - no model, no credential needed")
+    else:
+        add({"api_key": "ok", "oauth": "ok", "none": "WARN", "conflict": "FAIL"}[auth], "defender auth", {
+            "api_key": "ANTHROPIC_API_KEY (API billing)",
+            "oauth": "CLAUDE_CODE_OAUTH_TOKEN (subscription; usage limits apply to long runs, see README)",
+            "none": "no model credential set - runs will refuse to start (or use DEFENDER_DRIVER=scripted)",
+            "conflict": "both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are set - set exactly one"}[auth])
+    ui = cfg.get("LAB_LANGFUSE_UI", "").lower() in TRUE
+    add("ok", "langfuse ui", f"published on 127.0.0.1:{cfg.get('LANGFUSE_UI_PORT', '3000')} only (reach it by SSH tunnel)"
+        if ui else "not published (default); set LAB_LANGFUSE_UI=1 to reach it through an SSH tunnel")
+    failed = sum(1 for r in rows if r[0] == "FAIL")
+    print(f"\ndoctor: {failed} problem(s), {sum(1 for r in rows if r[0] == 'WARN')} warning(s)")
+    sys.exit(1 if failed else 0)
 
 
 def cmd_build(args: argparse.Namespace) -> None:
@@ -258,7 +557,16 @@ def cmd_build(args: argparse.Namespace) -> None:
 def cmd_up(_args: argparse.Namespace) -> None:
     if not (LAB / "defender/gitea_admin_token").exists():
         sys.exit("up: the golden image has not been built — run `labctl.py build` first")
-    compose("up", "-d", "--wait")
+    cfg = settings()
+    auth = defender_auth(cfg)
+    if auth == "conflict":
+        sys.exit("up: both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are set (.env or environment); "
+                 "set exactly one")
+    if cfg.get("DEFENDER_DRIVER", "sdk") == "sdk":
+        print(f"up: defender model credential: {auth}"
+              + ("" if auth != "none" else " — runs will refuse to start until one is set in .env"))
+    print(f"up: compose files: {', '.join(compose_files())}")
+    compose("up", "-d", "--wait", "--remove-orphans")
 
 
 def cmd_down(args: argparse.Namespace) -> None:
@@ -288,8 +596,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     sys.exit(result.returncode)
 
 
-def cmd_status(_args: argparse.Namespace) -> None:
-    compose("exec", "-T", "observer", "lab-observer", "status", check=False)
+def cmd_status(args: argparse.Namespace) -> None:
+    """Phase of the current/last run; with --summary an interim digest read from C3 (read-only).
+    Both go through `docker compose exec` — no network connection into the observer."""
+    if args.summary:
+        compose("exec", "-T", "observer", "lab-observer", "summary", *(["--json"] if args.json else []),
+                *([args.run_id] if args.run_id else []), check=False)
+    else:
+        compose("exec", "-T", "observer", "lab-observer", "status", check=False)
 
 
 def cmd_score(args: argparse.Namespace) -> None:
@@ -337,7 +651,11 @@ def main() -> None:
     p.add_argument("manifest")
     p.add_argument("--detach", action="store_true")
     p.add_argument("--no-reset", action="store_true", help="do not reset the target from the golden snapshot")
-    add("status", cmd_status, "show the current/last run")
+    p = add("status", cmd_status, "show the current/last run")
+    p.add_argument("--summary", action="store_true",
+                   help="interim digest of the run so far, read-only from the datastore")
+    p.add_argument("--json", action="store_true", help="with --summary: machine-readable output")
+    p.add_argument("run_id", nargs="?", help="with --summary: a specific run (default: current/last)")
     p = add("score", cmd_score, "compute the metrics report for a run and copy it to runs/")
     p.add_argument("run_id")
     add("reset-target", cmd_reset_target, "reset the target VM from the golden snapshot")

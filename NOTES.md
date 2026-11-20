@@ -24,10 +24,14 @@ Companion to `BUILD_PLAN.md` (design decisions) and `README.md` (how to run it).
 
 ## Assumptions
 
-- **A "real VM" without KVM.** WSL2 on this machine exposes no `/dev/kvm`, so the target runs
-  under QEMU's software emulation (TCG). It is a full VM (own kernel, systemd, auditd, netem),
-  just slower. On a host with KVM it is used automatically. Latency numbers measured under TCG
-  are not comparable with numbers from a KVM or cloud run.
+- **KVM or TCG.** The target uses KVM when the Docker host has `/dev/kvm` (`compose.kvm.yaml`
+  passes the device in) and QEMU's software emulation (TCG) otherwise. TCG is a full VM (own
+  kernel, systemd, auditd, netem), just slower, and its latency numbers are not comparable with
+  KVM runs. Correction: earlier notes said WSL2 on this machine has no `/dev/kvm`. On
+  2026-11-20 `labctl.py doctor` found `/dev/kvm` in the WSL distro, and the running target VM
+  had been started with `-accel kvm` (the hypervisor creates the device node itself when the
+  host offers it). Which accelerator the earlier smoke runs used is recorded per run in
+  `run_start` (`hypervisor.accel`), not here.
 - **Target sizing.** Spec guideline is 4 vCPU / 8 GB / 40 GB. `.env` on this machine sets
   4 GB because the whole lab shares 16 GB of WSL memory; the default in `compose.yaml` is 8 GB.
 - **Gitea 28.4.0** is what the release API reported as the current stable release. Its egress
@@ -105,6 +109,91 @@ evidence behind every verdict so each can be checked by hand.
   the audit configuration and log directory, and the observer pulls every 20 s, so tampering
   would itself be recorded — but this is deterrence by visibility, not prevention.
 
+## Remote single-host deployment (added 2026-11-20)
+
+The lab is meant to run on one remote Linux host (a VPS or a dedicated server), headless over
+SSH. Still one host, still Docker Compose, nothing provider-specific. What changed:
+
+- **`labctl.py` on plain Linux.** `docker` on PATH is used directly; the WSL route is taken
+  only when `docker` is missing and `wsl.exe` exists. `.env` is now read by `labctl.py` itself
+  (the shell overrides it) and handed to Compose through the process environment; Compose no
+  longer reads `.env` directly. Multi-line host scripts go in on stdin as bytes, because
+  `wsl.exe` mangles multi-line arguments and Windows text-mode pipes add CRs.
+- **`scripts/host-setup.sh`** prepares a fresh Debian/Ubuntu host: Docker Engine + Compose
+  plugin from Docker's apt repository, `python3-venv`, kernel modules (`tun`, `macvlan`,
+  `nf_tables`, `kvm_intel`/`kvm_amd`) loaded and persisted, docker group, `.venv`, then
+  `doctor`. It opens no ports and does not touch the host firewall.
+- **`labctl.py doctor`** reports item by item: Python/venv, Docker engine, Compose v2,
+  architecture, kernel, `/dev/net/tun`, macvlan (by creating and removing a throwaway internal
+  macvlan network), nftables (by running `nft` in a container from the gateway image once it
+  is built; a module/kernel-config check before that), CPU/RAM/disk against the sizing table,
+  KVM (available on the host, and whether the running VM really uses it, read from QEMU's
+  command line), the defender credential, and Langfuse UI exposure. Exit code 1 on any FAIL.
+- **KVM** is passed in explicitly by an overlay instead of relying only on the device-cgroup
+  rule plus `mknod` (which stays as the fallback). `LAB_KVM=0` forces TCG.
+- **Subscription auth** (`CLAUDE_CODE_OAUTH_TOKEN`) next to `ANTHROPIC_API_KEY`, exactly one
+  (README, "The agent"). Enforced in three places: `labctl.py` passes only one to Compose and
+  `up` refuses if both are set; `compose.yaml` declares both without a default, so one that is
+  not passed is absent in the container (checked with a throwaway container); the defender
+  entrypoint unsets `ANTHROPIC_API_KEY` under OAuth and the runtime refuses to start with both.
+- **Langfuse UI**: opt-in overlay, 127.0.0.1 only, for an SSH tunnel.
+- **`status --summary`**: read-only interim digest (README, "Following a run").
+- **Token and cost accounting**: new agent-view event `defender/agent_turn` (next section).
+
+Caveats:
+
+- **Not yet tried on a real fresh VM.** `host-setup.sh` has not been run on a fresh Debian or
+  Ubuntu machine from here (this machine is Windows/WSL). The Linux path of `labctl.py` is
+  covered by unit tests and `doctor` ran against Docker in WSL, but expect the first real
+  run of the script to need small fixes.
+- **The Langfuse UI opt-in adds a network leg.** Docker cannot publish a port from a container
+  that is only on internal networks, so `langfuse-web` joins a bridge network that only it is
+  on, with outbound NAT off. It does not route between its legs and the observer segment is
+  untouched, so the independence rule holds; but while the opt-in is on, Langfuse (in the
+  defender's segment) has an interface toward the host. Off by default; turn it off after use.
+- **Run Compose only through `labctl.py`.** Called directly from the repository root, Compose
+  reads `.env` itself, and both credential variables would reach the container if both are in
+  `.env` (the entrypoint then refuses to start).
+- **Subscription usage limits** can stop the agent's turns for hours during a long run. That
+  shows as `driver_error` in ground truth and as an inactive agent in the metrics: a property
+  of the setup, not of the agent. Prefer an API key for long runs.
+- **`status --summary` reads the whole run from C3** on every call. Fine for hours and days,
+  but it gets slower as the run grows; it never blocks the writer (WAL).
+- **KVM detection runs where `labctl.py` runs** (or in the WSL distro). A remote `DOCKER_HOST`
+  is not supported for it.
+
+## Token and cost accounting (added 2026-11-20)
+
+- **Event.** `defender/agent_turn`, one per agent turn (check-in): `input_tokens`,
+  `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cost_usd` (nullable), plus
+  `cost_basis`, `auth`, `model`, `model_requests`, `duration_ms`, `is_error`, `accounting`,
+  `counter_reset`. Counters only, no text. Added to the telemetry contract, the JSON Schema and
+  the validator. Its source is `defender`, so the store puts it in `agent_view_events`; the
+  ground-truth table cannot take it.
+- **Where the numbers come from.** The SDK's `ResultMessage` carries `model_usage` (per model,
+  every call including subagents and compaction) and `total_cost_usd`. Both are
+  **session-cumulative** in a streaming session (per the field descriptions in the CLI bundled
+  with `claude-agent-sdk` 0.2.182); `usage` is per turn but covers the main loop only.
+  `defender/defender/usage.py` turns the cumulative totals into per-turn deltas, treats a
+  decrease as a counter reset (counted from zero and flagged), and ignores an all-zero crash
+  result without moving its baseline. Not yet seen with a real model: on the first real run,
+  check that the per-turn figures look plausible and that `counter_reset` is rare.
+- **Cost is an estimate**: the SDK's own figure at API list prices ("an estimate, not a
+  billing statement"). Under a subscription token nothing is billed per token; the payload says
+  `cost_basis: estimate_only_not_billed_subscription`, and the reports lead with tokens.
+- **Scoring.** `metrics.usage()` gives totals, a timeline (buckets of `snapshot_interval`) and
+  a per-incident figure; `report.md` has a section and `usage_timeseries.csv` the series. It
+  reads ground truth only for the time axis (run start, incident windows), and nothing reads
+  it: a unit test checks that metrics 1–5 and the supporting findings are identical with and
+  without large `agent_turn` events.
+- **Per-incident attribution is per turn**, not per tool call. A turn (from `ts` minus
+  `duration_ms` to `ts`) counts toward every injected fault whose window overlaps it
+  (injection until C2 first saw the condition closed, else run end), split equally across
+  overlapping incidents so the parts add up to the total. A turn spent on something else while
+  an incident was open is still charged to that incident; ops tasks are not incidents here.
+- The scripted stand-in emits one `agent_turn` per tick with zero tokens and no cost, so the
+  pipeline is exercised without a model.
+
 ## Things specific to this machine
 
 - **WSL idle shutdown.** WSL stops its VM (and Docker, and the lab) when no `wsl.exe` process is
@@ -114,7 +203,7 @@ evidence behind every verdict so each can be checked by hand.
 - **Docker's `internal` bridge networks cannot be used for the segments here**: the WSL kernel
   passes bridged traffic through iptables, and Docker's rules then drop anything routed via a
   gateway container. The segments are internal *macvlan* networks instead.
-- `labctl.py` reaches Docker through `wsl.exe` when `docker` is not on PATH.
+- `labctl.py` reaches Docker through `wsl.exe` when `docker` is not on PATH (Windows only).
 
 ## Open questions for you
 
@@ -128,7 +217,8 @@ evidence behind every verdict so each can be checked by hand.
 3. **Check-in interval for the agent** (`DEFENDER_TICK_SECONDS`, default 300 s). The spec does
    not say how a long-running agent is paced. Shorter means faster reaction and more tokens.
 4. **Budget.** `DEFENDER_MAX_BUDGET_USD` is supported but unset. For a 14-day run you will want
-   a ceiling.
+   a ceiling. It caps the SDK's *estimated* spend, so under a subscription token, where nothing
+   is billed, it still works as a usage ceiling.
 5. **Model comparison via OpenHands** (spec B.1 alternative) is not built. The instrumentation
    is framework-agnostic (`defender/defender/instrumentation.py` has no SDK dependency), so an
    adapter would be a new driver next to `sdk_driver.py`.

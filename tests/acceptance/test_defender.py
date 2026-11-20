@@ -16,6 +16,10 @@ ALLOWED_PAYLOAD_KEYS = {
     "decision": {"intent", "tool", "tool_call_id"},
     "incident_report": {"incident_id", "detected", "root_cause", "action_taken", "status", "confidence"},
     "state_snapshot": {"notes", "trigger", "notes_chars", "incidents_reported", "compaction_trigger"},
+    # counters only: token counts, the SDK's cost estimate, and how they were obtained
+    "agent_turn": {"turn", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+                   "cost_usd", "cost_basis", "auth", "accounting", "counter_reset", "model", "model_requests",
+                   "is_error", "duration_ms"},
 }
 
 
@@ -82,7 +86,7 @@ out({{"observations": len(mine), "tool_spans": len(tools),
       "largest": max((len(json.dumps(r)) for r in mine), default=0)}})''')
     assert res["tool_spans"] > 0 and res["tool_types"] == ["TOOL"], "Langfuse must hold the tool calls as tool spans"
     assert "ssh_exec" in res["tool_names"] and res["provider"] == ["anthropic"]
-    assert set(res["event_types"]) >= {"tool_call", "decision", "incident_report", "state_snapshot"}
+    assert set(res["event_types"]) >= {"tool_call", "decision", "incident_report", "state_snapshot", "agent_turn"}
     in_c3 = len(smoke_run["agent"])
     assert res["observations"] >= in_c3, "everything in C3's agent view must have come from Langfuse"
     # no full context: Langfuse's prompt/completion fields stay empty, the context sentinel never appears
@@ -113,7 +117,7 @@ def test_incident_reports_and_state_snapshots_follow_schema_1_3(smoke_run):
 
 # ---------------------------------------------------------------- never the full context
 
-def test_agent_view_contains_only_the_four_event_types_within_size_caps(smoke_run):
+def test_agent_view_contains_only_the_defined_event_types_within_size_caps(smoke_run):
     sentinel = lab_env()["LAB_CONTEXT_SENTINEL"]
     for event in smoke_run["agent"]:
         payload = event["payload"]
@@ -223,11 +227,11 @@ out({"direct": tcp_open("1.1.1.1", 443), "direct_fetch": fetch("https://1.1.1.1/
 
 
 def test_real_agent_needs_an_api_key_and_says_so():
-    """With the SDK driver and no key the defender must refuse to start, not run silently without a model."""
+    """With the SDK driver and no credential the defender must refuse to start, not run silently without a model."""
     if defender_driver() != "sdk":
         pytest.skip("defender is configured with the scripted stand-in")
-    if role_py("defender", 'out(bool(os.environ.get("ANTHROPIC_API_KEY")))'):
-        pytest.skip("an API key is configured; nothing to refuse")
+    if role_py("defender", 'out(bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")))'):
+        pytest.skip("a model credential is configured; nothing to refuse")
     res = observer_do('''
 from observer.clients import DefenderAPI
 try:
@@ -235,3 +239,32 @@ try:
 except RuntimeError as exc:
     out(str(exc))''')
     assert "ANTHROPIC_API_KEY" in res, res
+
+
+def test_usage_is_mirrored_into_the_agent_view_only(smoke_run):
+    """Per-turn token accounting reaches C3 as defender/agent_turn — in the agent-view layer, never in ground truth."""
+    turns = of(smoke_run["agent"], "agent_turn")
+    assert turns, "every agent turn must produce an agent_turn event"
+    for ev in turns:
+        telemetry.validate_event(ev)
+        assert ev["source"] == "defender"
+    assert not [e for e in smoke_run["truth"] if e["type"] == "agent_turn"]
+
+
+def test_with_an_oauth_token_the_agent_process_has_no_api_key():
+    """Subscription auth must not be able to fall back to API billing."""
+    res = role_py("defender", '''
+import pathlib
+env = {}
+for proc in pathlib.Path("/proc").glob("[0-9]*/environ"):
+    try:
+        data = proc.read_bytes()
+    except OSError:
+        continue
+    if b"defender.runtime" in pathlib.Path(str(proc).replace("environ", "cmdline")).read_bytes():
+        env = dict(kv.split(b"=", 1) for kv in data.split(b"\\0") if b"=" in kv)
+out({"oauth": bool(env.get(b"CLAUDE_CODE_OAUTH_TOKEN")), "api_key": b"ANTHROPIC_API_KEY" in env,
+     "auth": (env.get(b"DEFENDER_AUTH") or b"").decode()})''')
+    if not res["oauth"]:
+        pytest.skip("no CLAUDE_CODE_OAUTH_TOKEN configured")
+    assert res["api_key"] is False and res["auth"] == "oauth", res

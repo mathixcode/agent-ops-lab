@@ -26,6 +26,7 @@ from labcontracts import telemetry as contract
 
 from .instrumentation import Telemetry
 from .toolkit import Toolkit
+from .usage import UsageMeter
 
 log = logging.getLogger("defender.scripted")
 
@@ -47,6 +48,7 @@ class ScriptedDriver:
         self.log_lines: list[str] = []
         self.did_unnoted_change = False
         self.last_error: str | None = None
+        self.meter = UsageMeter("none")       # no model: every turn counts zero tokens, no cost
 
     # ------------------------------------------------------------------ same path as the SDK hooks
     def call(self, tool: str, intent: str | None, **args: Any) -> tuple[bool, str]:
@@ -155,11 +157,17 @@ class ScriptedDriver:
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
+            started, failed = time.time(), False
             try:
                 await asyncio.to_thread(self.tick)
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"[:300]
+                failed = True
                 log.exception("scripted tick failed")
+            # same agent_turn event as the SDK driver, so the usage pipeline is exercised end to end
+            self.tel.agent_turn(started, {"turn": self.ticks, "model": "none (scripted stand-in)",
+                                          **self.meter.turn(None, None, None)}, 0, failed,
+                                int((time.time() - started) * 1000))
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.tick_seconds)
             except asyncio.TimeoutError:

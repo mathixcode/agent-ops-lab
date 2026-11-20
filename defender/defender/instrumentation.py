@@ -1,7 +1,7 @@
 """B.3 — instrumentation of the defender: the agent's view, captured from inside.
 
 Framework-agnostic: any driver (Claude Agent SDK hooks, the scripted stand-in, a future
-OpenHands adapter) calls the four methods below. Each produces one OpenTelemetry span that
+OpenHands adapter) calls the methods below. Each produces one OpenTelemetry span that
 follows the pinned GenAI conventions and carries the spec 1.3 event in lab.event.* attributes.
 The spans go to Langfuse; the observer later pulls them from there into C3.
 
@@ -10,6 +10,7 @@ What is captured, and nothing else:
     decision         short form of the intent
     incident_report  the fixed schema
     state_snapshot   dump of the agent's notes
+    agent_turn       per-turn token counts and the SDK's cost estimate (counters only)
 
 This module has no method that accepts a prompt, a message or a transcript, so the model's
 context cannot be logged through it. This is the agent's SELF-REPORT — never ground truth.
@@ -95,7 +96,7 @@ class Telemetry:
         span.end(end_time=int(end * 1e9))
         self.counts[type_] = self.counts.get(type_, 0) + 1
 
-    # ------------------------------------------------------------------ the four event types
+    # ------------------------------------------------------------------ the action/report event types
     def decision(self, intent: str, tool: str | None = None, tool_call_id: str | None = None) -> None:
         payload = {"intent": clip((intent or "").strip() or "(no intent stated)", MAX_INTENT_CHARS)}
         if tool:
@@ -130,24 +131,24 @@ class Telemetry:
                    **{k: v for k, v in extra.items() if isinstance(v, (str, int, float, bool))}}
         self._emit("state_snapshot", payload, "state_snapshot", {})
 
-    # ------------------------------------------------------------------ usage (Langfuse only, no content)
-    def agent_turn(self, started: float, usage: dict[str, Any] | None, cost_usd: float | None,
-                   num_turns: int | None, is_error: bool) -> None:
-        """One invoke_agent span per agent turn with token counts and cost — no text of any kind.
-        It carries no lab.event.type, so it is not mirrored into C3."""
-        usage = usage or {}
-        attrs = {sc.GEN_AI_OPERATION_NAME: sc.OPERATION_INVOKE_AGENT, sc.GEN_AI_PROVIDER_NAME: sc.PROVIDER_ANTHROPIC,
-                 sc.GEN_AI_AGENT_NAME: AGENT_NAME, sc.GEN_AI_REQUEST_MODEL: self.model,
-                 sc.GEN_AI_CONVERSATION_ID: self.run_id, sc.LANGFUSE_SESSION_ID: self.run_id,
-                 sc.LAB_RUN_ID: self.run_id,
-                 sc.GEN_AI_USAGE_INPUT_TOKENS: int(usage.get("input_tokens") or 0),
-                 sc.GEN_AI_USAGE_OUTPUT_TOKENS: int(usage.get("output_tokens") or 0),
-                 "lab.agent.turns": int(num_turns or 0), "lab.agent.cost_usd": float(cost_usd or 0.0)}
+    # ------------------------------------------------------------------ usage (counters only, no content)
+    def agent_turn(self, started: float, accounting: dict[str, Any], num_turns: int | None, is_error: bool,
+                   duration_ms: int | None = None) -> None:
+        """One invoke_agent span per agent turn, mirrored into C3 as defender/agent_turn.
+
+        `accounting` comes from usage.UsageMeter: per-turn token counts and the SDK's cost
+        estimate. Counters only — no text of any kind. This is the agent's runtime counting
+        its own consumption: agent view, never ground truth."""
+        payload = {"model": self.model, **accounting, "model_requests": int(num_turns or 0),
+                   "is_error": bool(is_error), "duration_ms": int(duration_ms or 0)}
+        attrs = {sc.GEN_AI_OPERATION_NAME: sc.OPERATION_INVOKE_AGENT, sc.GEN_AI_REQUEST_MODEL: payload["model"],
+                 sc.GEN_AI_USAGE_INPUT_TOKENS: int(accounting.get("input_tokens") or 0),
+                 sc.GEN_AI_USAGE_OUTPUT_TOKENS: int(accounting.get("output_tokens") or 0),
+                 "lab.agent.cache_read_tokens": int(accounting.get("cache_read_tokens") or 0),
+                 "lab.agent.cost_usd": float(accounting.get("cost_usd") or 0.0)}
         if is_error:
             attrs[sc.ERROR_TYPE] = "agent_turn_error"
-        span = self.tracer.start_span(f"{sc.OPERATION_INVOKE_AGENT} {AGENT_NAME}",
-                                      start_time=int(started * 1e9), attributes=attrs)
-        span.end()
+        self._emit("agent_turn", payload, f"{sc.OPERATION_INVOKE_AGENT} {AGENT_NAME}", attrs, start=started)
 
     def flush(self) -> None:
         try:

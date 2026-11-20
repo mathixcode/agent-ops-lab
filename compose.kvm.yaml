@@ -1,0 +1,10 @@
+# Overlay added by labctl.py when the Docker host has /dev/kvm (disable with LAB_KVM=0).
+# Passes the device into the hypervisor so the target VM runs with KVM acceleration instead of
+# TCG software emulation. Nothing else changes: no network, no port, no extra privilege.
+services:
+  target-hv:
+    devices:
+      - /dev/kvm:/dev/kvm
+  target-build:
+    devices:
+      - /dev/kvm:/dev/kvm

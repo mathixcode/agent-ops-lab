@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 EVENT_TYPES: dict[str, tuple[str, ...]] = {
-    "defender": ("tool_call", "decision", "incident_report", "state_snapshot"),
+    "defender": ("tool_call", "decision", "incident_report", "state_snapshot", "agent_turn"),
     "target": ("service_log", "config_change", "health"),
     "monitor": ("probe_result", "ground_truth_snapshot", "fault_injected", "task_assigned",
                 "load_event", "run_start", "run_end"),
@@ -33,6 +33,7 @@ REQUIRED_PAYLOAD: dict[tuple[str, str], tuple[str, ...]] = {
     ("defender", "incident_report"): ("incident_id", "detected", "root_cause", "action_taken",
                                       "status", "confidence"),
     ("defender", "state_snapshot"): ("notes",),
+    ("defender", "agent_turn"): ("input_tokens", "output_tokens", "cache_read_tokens", "cost_usd"),
     ("target", "service_log"): ("unit", "message"),
     ("target", "config_change"): ("kind",),
     ("target", "health"): ("services",),
@@ -83,6 +84,20 @@ def validate_incident_report(p: dict[str, Any]) -> None:
         raise ContractError("incident_report.confidence must be a number in [0, 1]")
 
 
+AGENT_TURN_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens")
+
+
+def validate_agent_turn(p: dict[str, Any]) -> None:
+    """Token and cost accounting for one agent turn. Agent-view only: it says what the
+    defender's own runtime counted, and is never evidence about the target."""
+    for key in AGENT_TURN_TOKEN_FIELDS:
+        if key in p and (isinstance(p[key], bool) or not isinstance(p[key], int) or p[key] < 0):
+            raise ContractError(f"agent_turn.{key} must be a non-negative integer")
+    c = p["cost_usd"]
+    if c is not None and (isinstance(c, bool) or not isinstance(c, (int, float)) or c < 0):
+        raise ContractError("agent_turn.cost_usd must be null or a non-negative number")
+
+
 def validate_event(ev: Any) -> dict[str, Any]:
     """Raise ContractError unless `ev` is a well-formed 1.3 event. Returns it unchanged."""
     if not isinstance(ev, dict):
@@ -112,6 +127,8 @@ def validate_event(ev: Any) -> dict[str, Any]:
         raise ContractError(f"{src}/{typ} payload is missing {absent}")
     if (src, typ) == ("defender", "incident_report"):
         validate_incident_report(payload)
+    if (src, typ) == ("defender", "agent_turn"):
+        validate_agent_turn(payload)
     return ev
 
 

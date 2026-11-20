@@ -3,6 +3,7 @@
     lab-observer run <manifest.yaml> [--no-reset]    execute one run (C1)
     lab-observer score <run_id>                      offline scoring (C4)
     lab-observer status                              current / last run
+    lab-observer summary [run_id] [--json]           interim digest, read-only from C3
     lab-observer reset-target                        golden-snapshot restore, wait until healthy
     lab-observer selfcheck                           can the observer reach what it must reach?
 """
@@ -27,6 +28,9 @@ def main() -> int:
     p = sub.add_parser("score")
     p.add_argument("run_id")
     sub.add_parser("status")
+    p = sub.add_parser("summary")
+    p.add_argument("run_id", nargs="?")
+    p.add_argument("--json", action="store_true")
     sub.add_parser("reset-target")
     sub.add_parser("selfcheck")
     args = parser.parse_args()
@@ -56,6 +60,10 @@ def main() -> int:
         path = cfg.data / "runs" / "current.json"
         print(path.read_text() if path.exists() else json.dumps({"phase": "no run yet"}))
         return 0
+
+    if args.command == "summary":
+        from .summary import main as summary_main
+        return summary_main(cfg.db_path, cfg.data / "runs" / "current.json", args.run_id, args.json)
 
     if args.command == "reset-target":
         from .orchestrator import Orchestrator

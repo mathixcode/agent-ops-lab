@@ -1,0 +1,27 @@
+# Opt-in overlay (LAB_LANGFUSE_UI=1 in .env), OFF by default: makes the Langfuse web UI
+# reachable on the Docker host at 127.0.0.1:${LANGFUSE_UI_PORT:-3000} — loopback only, never
+# 0.0.0.0 — so on a remote host it is reachable only through an SSH tunnel. Always open it on
+# your own machine as http://localhost:3000 (the login flow returns there):
+#
+#     ssh -N -L 3000:127.0.0.1:${LANGFUSE_UI_PORT:-3000} <user>@<host>
+#
+# Docker cannot publish a port from a container whose networks are all internal, so this gives
+# langfuse-web one extra leg: a bridge network that ONLY langfuse-web joins, with outbound
+# masquerading switched off (no NAT to the Internet through it). It does not touch the lab
+# segments: the observer segment stays unreachable from the target and the defender, and
+# Langfuse does not forward packets between its legs.
+services:
+  langfuse-web:
+    ports:
+      - "127.0.0.1:${LANGFUSE_UI_PORT:-3000}:3000"
+    environment:
+      # browser logins come back to the tunnelled address, not to the lab-internal one
+      NEXTAUTH_URL: http://localhost:3000
+    networks:
+      langfuse_ui: {}
+
+networks:
+  langfuse_ui:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"

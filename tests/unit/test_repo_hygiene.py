@@ -110,9 +110,50 @@ def test_each_role_mounts_only_its_own_secrets():
 
 def test_credentials_in_the_environment_follow_the_access_table():
     env = {name: set((svc.get("environment") or {}).keys()) for name, svc in COMPOSE["services"].items()}
-    holders = {"ANTHROPIC_API_KEY": {"defender"},
+    holders = {"ANTHROPIC_API_KEY": {"defender"}, "CLAUDE_CODE_OAUTH_TOKEN": {"defender"},
                "LAB_HV_TOKEN": {"observer", "target-hv"},
                "LAB_GATEWAY_TOKEN": {"observer", "gateway"},
                "LAB_DEFENDER_TOKEN": {"observer", "defender"}}
     for var, allowed in holders.items():
         assert {n for n, keys in env.items() if var in keys} == allowed, var
+
+
+def test_model_credentials_have_no_default_so_an_absent_one_stays_unset():
+    """compose.yaml passes the credentials through without a value: Compose then leaves a
+    variable that labctl did not pass UNSET in the container (not set to an empty string)."""
+    env = COMPOSE["services"]["defender"]["environment"]
+    assert env["ANTHROPIC_API_KEY"] is None and env["CLAUDE_CODE_OAUTH_TOKEN"] is None
+
+
+def test_defender_entrypoint_removes_the_api_key_under_oauth():
+    script = (ROOT / "defender/entrypoint.sh").read_text(encoding="utf-8")
+    oauth_branch = script.split('elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then', 1)[1].split("elif", 1)[0]
+    assert "unset ANTHROPIC_API_KEY" in oauth_branch
+    assert "exit 64" in script.split('elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]', 1)[0]
+
+
+# ---------------------------------------------------------------- optional overlays
+
+KVM_OVERLAY = yaml.safe_load((ROOT / "compose.kvm.yaml").read_text(encoding="utf-8"))
+UI_OVERLAY = yaml.safe_load((ROOT / "compose.langfuse-ui.yaml").read_text(encoding="utf-8"))
+
+
+def test_kvm_overlay_only_passes_the_kvm_device_to_the_hypervisor():
+    assert set(KVM_OVERLAY) == {"services"}
+    assert set(KVM_OVERLAY["services"]) == {"target-hv", "target-build"}
+    for svc in KVM_OVERLAY["services"].values():
+        assert svc == {"devices": ["/dev/kvm:/dev/kvm"]}
+
+
+def test_langfuse_ui_overlay_binds_loopback_only_and_touches_nothing_else():
+    assert set(UI_OVERLAY["services"]) == {"langfuse-web"}
+    web = UI_OVERLAY["services"]["langfuse-web"]
+    assert web["ports"] and all(str(p).startswith("127.0.0.1:") for p in web["ports"])
+    assert not any(str(p).startswith(("0.0.0.0", ":")) or str(p).count(":") < 2 for p in web["ports"])
+    assert set(web["networks"]) == {"langfuse_ui"}
+    net = UI_OVERLAY["networks"]["langfuse_ui"]
+    assert net["driver"] == "bridge"
+    assert net["driver_opts"]["com.docker.network.bridge.enable_ip_masquerade"] == "false"
+    assert "langfuse_ui" not in COMPOSE["networks"], "the UI network must not exist without the opt-in"
+    for name, svc in COMPOSE["services"].items():
+        assert "langfuse_ui" not in (svc.get("networks") or {}), name

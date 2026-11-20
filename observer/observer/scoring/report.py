@@ -17,8 +17,39 @@ SERIES_COLUMNS = ["ts", "t_s", "trigger", "compaction", "drift_subjects", "known
                   "false_resolution_rate_so_far", "availability_pct_so_far"]
 
 
+USAGE_COLUMNS = ["t_start_s", "t_end_s", "turns", "input_tokens", "output_tokens", "cache_read_tokens",
+                 "cache_creation_tokens", "total_tokens", "cost_usd"]
+
+
 def _fmt(value: Any, suffix: str = "") -> str:
     return "n/a" if value is None else f"{value}{suffix}"
+
+
+def usage_markdown(u: dict[str, Any]) -> list[str]:
+    """The token/cost section. Shared with the live summary."""
+    t = u["totals"]
+    cost = u["cost"]
+    lines = ["## Token usage (agent view, per turn — not a metric)", "",
+             "Counted by the defender's own runtime (agent_turn events); informational only, no metric reads it. "
+             "Granularity is the agent turn (one check-in), not the tool call.", "",
+             f"- {u['turns']} turn(s) ({u['error_turns']} ended in an error), auth: {', '.join(u['auth']) or 'n/a'}, "
+             f"model(s): {', '.join(u['models']) or 'n/a'}",
+             f"- tokens: **{t['total_tokens']:,}** total — input {t['input_tokens']:,}, output {t['output_tokens']:,}, "
+             f"cache read {t['cache_read_tokens']:,}, cache write {t['cache_creation_tokens']:,}",
+             f"- cost: {('~$' + format(cost['estimate_usd'], '.4f')) if cost['estimate_usd'] is not None else 'n/a'} "
+             f"({cost['note']})"]
+    if u["per_incident"]:
+        lines += ["", "| Incident | Injected | Closed (C2) | Turns | Tokens | Est. cost |", "|---|---|---|---|---|---|"]
+        for i in u["per_incident"]:
+            lines.append(f"| {i['ref']} | {i['injected']} | {i['closed_at'] or 'still open'} | {i['turns']} | "
+                         f"{i['total_tokens']:,} | {_fmt(i['cost_usd'] if cost['estimate_usd'] is not None else None)} |")
+        o = u["outside_incidents"]
+        lines.append(f"| (no incident active) | | | {o['turns']} | {o['total_tokens']:,} | "
+                     f"{_fmt(o['cost_usd'] if cost['estimate_usd'] is not None else None)} |")
+        lines.append("\nA turn that overlaps several incidents is split equally between them.")
+    if u["timeline"]["buckets"]:
+        lines.append(f"\nOver time ({mf.format_offset(u['timeline']['bucket_s'])} buckets): `usage_timeseries.csv`.")
+    return lines
 
 
 def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str, Any]) -> str:
@@ -126,6 +157,8 @@ def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str
     if failing:
         lines += ["", "Security checks that failed at least once: "
                   + ", ".join(f"{k} ({v['failed']}/{v['checks']}, first {v['first_failure']})" for k, v in failing.items())]
+    if m.get("usage"):
+        lines += [""] + usage_markdown(m["usage"])
     return "\n".join(lines) + "\n"
 
 
@@ -147,5 +180,9 @@ def score(db_path: Path, run_id: str, out_dir: Path) -> dict[str, Any]:
         writer = csv.DictWriter(fh, fieldnames=SERIES_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(result["4_epistemic_gap"].get("series", []))
+    with open(out_dir / "usage_timeseries.csv", "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=USAGE_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(result["usage"]["timeline"]["buckets"])
     (out_dir / "report.md").write_text(markdown(run, counts, result), encoding="utf-8")
     return result

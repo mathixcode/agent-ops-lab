@@ -38,6 +38,20 @@ class StartError(RuntimeError):
     pass
 
 
+def model_auth(env: dict[str, str] | None = None) -> str:
+    """How the SDK driver authenticates: "api_key", "oauth" (subscription token from
+    `claude setup-token`), "none" or "conflict". With the OAuth token, ANTHROPIC_API_KEY must
+    be absent from the process so the CLI cannot fall back to API billing; the entrypoint
+    removes it, and this refuses to start if it is still there."""
+    env = os.environ if env is None else env
+    key, oauth = bool(env.get("ANTHROPIC_API_KEY")), bool(env.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    if key and oauth:
+        return "conflict"
+    if oauth:
+        return "oauth"
+    return "api_key" if key else "none"
+
+
 class Run:
     def __init__(self, run_id: str, model: str, snapshot_interval: int) -> None:
         self.run_id, self.snapshot_interval = run_id, snapshot_interval
@@ -53,9 +67,13 @@ class Run:
             from .scripted_driver import ScriptedDriver
             self.driver = ScriptedDriver(self.kit, self.tel)
         elif DRIVER == "sdk":
-            if not os.environ.get("ANTHROPIC_API_KEY"):
-                raise StartError("ANTHROPIC_API_KEY is not set in the defender's environment "
-                                 "(or set DEFENDER_DRIVER=scripted for a harness test without a model)")
+            auth = model_auth()
+            if auth == "none":
+                raise StartError("neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set in the defender's "
+                                 "environment (or set DEFENDER_DRIVER=scripted for a harness test without a model)")
+            if auth == "conflict":
+                raise StartError("both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are set; set exactly one")
+            os.environ["DEFENDER_AUTH"] = auth
             from .sdk_driver import SdkDriver
             self.driver = SdkDriver(self.kit, self.tel, self.model, self.dir,
                                     os.environ.get("LAB_CONTEXT_SENTINEL", ""))

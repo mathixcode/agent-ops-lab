@@ -32,6 +32,8 @@ SAMPLE_PAYLOADS = {
     ("defender", "incident_report"): {"incident_id": "INC-1", "detected": True, "root_cause": "x",
                                       "action_taken": "y", "status": "resolved", "confidence": 0.8},
     ("defender", "state_snapshot"): {"notes": "# notes"},
+    ("defender", "agent_turn"): {"input_tokens": 1200, "output_tokens": 300, "cache_read_tokens": 9000,
+                                 "cache_creation_tokens": 0, "cost_usd": 0.0123, "auth": "oauth"},
     ("target", "service_log"): {"unit": "gitea.service", "message": "started"},
     ("target", "config_change"): {"kind": "file_write"},
     ("target", "health"): {"services": {"gitea": "active"}},
@@ -89,6 +91,26 @@ def test_incident_report_schema_is_enforced(field, value):
     payload = dict(SAMPLE_PAYLOADS[("defender", "incident_report")], **{field: value})
     with pytest.raises(telemetry.ContractError):
         telemetry.make_event("run-x", "defender", "incident_report", 1, payload)
+
+
+@pytest.mark.parametrize("field,value", [("input_tokens", -1), ("output_tokens", 1.5), ("cache_read_tokens", "9"),
+                                         ("cost_usd", -0.1), ("cost_usd", "0.01"), ("input_tokens", True)])
+def test_agent_turn_counters_are_enforced_by_both_validators(field, value):
+    payload = dict(SAMPLE_PAYLOADS[("defender", "agent_turn")], **{field: value})
+    ev = {"ts": "2026-11-16T18:00:00.000Z", "run_id": "r", "source": "defender", "type": "agent_turn", "seq": 1,
+          "payload": payload}
+    with pytest.raises(telemetry.ContractError):
+        telemetry.validate_event(ev)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(ev, SCHEMA)
+
+
+def test_agent_turn_cost_may_be_unknown_and_belongs_to_the_agent_view():
+    payload = dict(SAMPLE_PAYLOADS[("defender", "agent_turn")], cost_usd=None)
+    ev = telemetry.make_event("r", "defender", "agent_turn", 1, payload)
+    jsonschema.validate(ev, SCHEMA)
+    assert "defender" in telemetry.AGENT_VIEW_SOURCES and "agent_turn" not in {
+        t for src in telemetry.GROUND_TRUTH_SOURCES for t in telemetry.EVENT_TYPES[src]}
 
 
 def test_layers_partition_the_sources():

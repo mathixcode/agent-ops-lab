@@ -6,6 +6,8 @@
     3 state_divergence  agent's notes vs. ground-truth snapshot, split into memory
                         failure and undetected change                                 [agent x truth]
     4 epistemic_gap     metrics 2 and 3 as a time series over the run                 [agent x truth]
+    usage               tokens/cost per agent turn, over time and per incident        [agent view;
+                        truth only as the time axis — informational, feeds no metric]
 
 Metrics 1 and 5 take only the GroundTruth layer: nothing the agent says can move them.
 Where the agent's view is involved (2-4) it is only ever *compared against* ground truth;
@@ -554,6 +556,114 @@ def epistemic_gap(truth: GroundTruth, agent: AgentView, divergence: dict[str, An
     }
 
 
+# ====================================================================== usage (agent view, not a metric)
+
+USAGE_TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens")
+
+
+def _usage_zero() -> dict[str, Any]:
+    return {"turns": 0.0, **{f: 0.0 for f in USAGE_TOKEN_FIELDS}, "total_tokens": 0.0, "cost_usd": 0.0}
+
+
+def _usage_add(acc: dict[str, Any], p: dict[str, Any], share: float = 1.0) -> None:
+    acc["turns"] += share
+    for f in USAGE_TOKEN_FIELDS:
+        acc[f] += share * (p.get(f) or 0)
+    acc["total_tokens"] += share * sum(p.get(f) or 0 for f in USAGE_TOKEN_FIELDS)
+    acc["cost_usd"] += share * (p.get("cost_usd") or 0.0)
+
+
+def _usage_round(acc: dict[str, Any]) -> dict[str, Any]:
+    out = {k: (round(v, 2) if k == "turns" else round(v, 6) if k == "cost_usd" else int(round(v)))
+           for k, v in acc.items()}
+    if out["turns"] == int(out["turns"]):
+        out["turns"] = int(out["turns"])
+    return out
+
+
+def incident_windows(truth: GroundTruth, now: dt.datetime | None = None) -> list[dict[str, Any]]:
+    """Injected faults as time windows: from injection until C2 first saw the condition closed,
+    or — if it never closed — until the end of the run (or `now` while it is still running)."""
+    end_of_run = truth.run_end.ts if truth.run_end else now or max((e.ts for e in truth.events), default=None)
+    out = []
+    for w in fault_windows(truth):
+        end = w.closed_at or end_of_run or w.injected
+        out.append({"ref": w.ref, "injected": w.injected, "closed_at": w.closed_at, "end": max(end, w.injected)})
+    return out
+
+
+def usage(truth: GroundTruth, agent: AgentView, bucket_s: float | None = None,
+          now: dt.datetime | None = None) -> dict[str, Any]:
+    """Token and cost accounting from the defender's agent_turn events.
+
+    AGENT VIEW, and not one of the five metrics: it is what the defender's runtime counted for
+    itself. No ground-truth metric reads it. Ground truth is used here for the time axis only
+    (run start, incident windows), never the other way round.
+
+    Granularity is the agent TURN (one check-in), not the tool call: the SDK reports usage per
+    turn. A turn is attributed to every injected incident whose window overlaps it, split
+    equally when several overlap, so the per-incident figures add up to the total. Cost is the
+    SDK's estimate at API list prices; under a subscription token nothing was billed, so the
+    token counts are the primary number."""
+    turns = agent.of("agent_turn")
+    rs = truth.run_start
+    t0 = rs.ts if rs else (turns[0].ts if turns else None)
+    if bucket_s is None:
+        interval = ((rs.payload.get("manifest") or {}).get("snapshot_interval") if rs else None)
+        bucket_s = float(interval) if isinstance(interval, (int, float)) and interval > 0 else 3600.0
+    total = _usage_zero()
+    errors = 0
+    bases, auths, models = set(), set(), set()
+    buckets: dict[int, dict[str, Any]] = {}
+    windows = incident_windows(truth, now)
+    per_incident = {i: _usage_zero() for i in range(len(windows))}
+    outside = _usage_zero()
+    for ev in turns:
+        p = ev.payload
+        _usage_add(total, p)
+        errors += 1 if p.get("is_error") else 0
+        bases.add(p.get("cost_basis") or "none")
+        auths.add(p.get("auth") or "none")
+        if p.get("model"):
+            models.add(p["model"])
+        if t0 is not None:
+            b = max(0, int((ev.ts - t0).total_seconds() // bucket_s))
+            _usage_add(buckets.setdefault(b, _usage_zero()), p)
+        start = ev.ts - dt.timedelta(milliseconds=p.get("duration_ms") or 0)
+        hit = [i for i, w in enumerate(windows) if start <= w["end"] and ev.ts >= w["injected"]]
+        if hit:
+            for i in hit:
+                _usage_add(per_incident[i], p, 1.0 / len(hit))
+        else:
+            _usage_add(outside, p)
+    timeline = [{"t_start_s": int(b * bucket_s), "t_end_s": int((b + 1) * bucket_s), **_usage_round(acc)}
+                for b, acc in sorted(buckets.items())]
+    incidents = [{"ref": w["ref"], "injected": _iso(w["injected"]), "closed_at": _iso(w["closed_at"]),
+                  "window_end": _iso(w["end"]), "still_open": w["closed_at"] is None,
+                  **_usage_round(per_incident[i])} for i, w in enumerate(windows)]
+    has_cost = any(ev.payload.get("cost_usd") is not None for ev in turns)
+    subscription = "oauth" in auths
+    return {
+        "layer": "agent_view",
+        "granularity": "per agent turn (one check-in), not per tool call",
+        "turns": len(turns), "error_turns": errors,
+        "totals": _usage_round(total),
+        "cost": {"estimate_usd": round(total["cost_usd"], 6) if has_cost else None,
+                 "basis": sorted(bases), "billed": False if subscription else None,
+                 "note": ("subscription OAuth token: no per-token bill; the USD figure is the SDK's estimate "
+                          "at API list prices" if subscription else
+                          "the SDK's estimate at API list prices, not a billing statement" if has_cost else
+                          "no cost reported")},
+        "auth": sorted(auths), "models": sorted(models),
+        "timeline": {"bucket_s": int(bucket_s), "buckets": timeline},
+        "per_incident": incidents,
+        "outside_incidents": _usage_round(outside),
+        "attribution": ("a turn counts toward every injected incident whose window (injection until the fault "
+                        "condition was first seen closed, else run end) overlaps it, split equally; turn-level, "
+                        "not tool-call-level"),
+    }
+
+
 # ====================================================================== supporting findings
 
 def supporting(truth: GroundTruth) -> dict[str, Any]:
@@ -621,4 +731,5 @@ def compute(truth: GroundTruth, agent: AgentView) -> dict[str, Any]:
     m3 = state_divergence(truth, agent)
     m4 = epistemic_gap(truth, agent, m3, m2)
     return {"1_ground_truth": m1, "2_false_resolution": m2, "3_state_divergence": m3,
-            "4_epistemic_gap": m4, "5_collateral": m5, "supporting": supporting(truth)}
+            "4_epistemic_gap": m4, "5_collateral": m5, "supporting": supporting(truth),
+            "usage": usage(truth, agent)}             # agent view, informational; feeds no metric

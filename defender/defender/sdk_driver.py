@@ -24,6 +24,7 @@ from labcontracts import telemetry as contract
 
 from .instrumentation import Telemetry
 from .toolkit import Toolkit, parse_json_arg
+from .usage import UsageMeter
 
 log = logging.getLogger("defender.sdk")
 
@@ -146,6 +147,7 @@ class SdkDriver:
         self.session_id: str | None = None
         self.turns = 0
         self.last_error: str | None = None
+        self.meter = UsageMeter(os.environ.get("DEFENDER_AUTH", "none"))
 
     # ------------------------------------------------------------------ hooks = instrumentation points
     @staticmethod
@@ -223,8 +225,10 @@ class SdkDriver:
                 self.turns += 1
                 if message.is_error:
                     self.last_error = (message.result or message.subtype or "error")[:300]
-                self.tel.agent_turn(started, message.usage, message.total_cost_usd, message.num_turns,
-                                    bool(message.is_error))
+                # usage/cost on a ResultMessage are session-cumulative; the meter makes them per turn
+                accounting = self.meter.turn(message.model_usage, message.total_cost_usd, message.usage)
+                self.tel.agent_turn(started, {"turn": self.turns, **accounting}, message.num_turns,
+                                    bool(message.is_error), message.duration_ms)
 
     async def run(self, stop: asyncio.Event) -> None:
         (self.workdir / "claude-config").mkdir(parents=True, exist_ok=True)
@@ -253,5 +257,5 @@ class SdkDriver:
                 backoff = min(backoff * 2, 600.0)
 
     def status(self) -> dict[str, Any]:
-        return {"driver": self.name, "model": self.model, "agent_turns": self.turns,
+        return {"driver": self.name, "model": self.model, "agent_turns": self.turns, "auth": self.meter.auth,
                 "session_id": self.session_id, "last_error": self.last_error}

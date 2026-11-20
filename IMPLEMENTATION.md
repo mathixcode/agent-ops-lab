@@ -84,15 +84,18 @@ labctl.py run manifest.yaml
             8. teardown: stop defender (→ final state_snapshot), final snapshot,
                integrity check, last condition/canary/task checks, drain collectors,
                gateway back to idle, run_end, export JSONL
+labctl.py status --summary            (any time during the run)
+  └─ lab-observer summary → summary.py: C3 opened read-only + current.json → digest
 labctl.py score <run_id>
-  └─ lab-observer score → scoring/report.py → metrics.json, timeseries.csv, report.md
+  └─ lab-observer score → scoring/report.py → metrics.json, timeseries.csv,
+                                               usage_timeseries.csv, report.md
 ```
 
 ### Where each kind of event comes from
 
 | Event (source/type) | Produced by | Reaches C3 via | C3 table |
 |---|---|---|---|
-| `defender/tool_call`, `decision`, `incident_report`, `state_snapshot` | `defender/instrumentation.py` (OTel spans) | Langfuse → `LangfuseCollector` (pull) | `agent_view_events` |
+| `defender/tool_call`, `decision`, `incident_report`, `state_snapshot`, `agent_turn` | `defender/instrumentation.py` (OTel spans) | Langfuse → `LangfuseCollector` (pull) | `agent_view_events` |
 | `monitor/run_start`, `run_end`, `fault_injected`, `task_assigned`, `load_event`, `probe_result`, `ground_truth_snapshot` | observer itself (`Emitter`) | written directly | `ground_truth_events` |
 | `target/config_change`, `service_log`, `health` | auditd, journald, nginx log, systemctl on the VM | `TargetCollector` over read-only SSH (pull) | `ground_truth_events` |
 | `gateway/egress_request`, `canary_egress` | `gateway/addon.py` → `events.jsonl` | `GatewayCollector` via gateway control API (pull) | `ground_truth_events` |
@@ -139,6 +142,10 @@ all use the same code, so the contract exists exactly once.
   `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC, milliseconds), known source/type, non-negative integer
   `seq`, required payload keys, and the full `incident_report` schema
   (`status ∈ resolved|mitigated|open`, `confidence ∈ [0,1]`, `detected` boolean).
+- `defender/agent_turn` is the one type beyond the spec's list: per-turn token counts and the
+  SDK's cost estimate. Required: `input_tokens`, `output_tokens`, `cache_read_tokens` (and, if
+  present, `cache_creation_tokens`) as non-negative integers, `cost_usd` as a non-negative number
+  or `null` (`validate_agent_turn`). Source `defender`, so it can only ever be agent view.
 - `make_event()` builds and validates in one step; `SeqCounter` is a thread-safe monotonic
   counter (one per emitting source, as the spec requires).
 - The JSON Schema file states the same contract for non-Python consumers; a unit test feeds
@@ -176,19 +183,32 @@ all use the same code, so the contract exists exactly once.
 
 ### 3.1 `labctl.py`
 
-Runs on the host with `.venv`'s interpreter. It calls `docker` directly when it is on PATH,
-otherwise through `wsl.exe -- docker` (this machine), forwarding selected `.env` variables via
-`WSLENV`. Every Compose call gets `--env-file .lab/lab.env` and, if present, `--env-file .env`.
+Runs on the Docker host with `.venv`'s interpreter. On Linux (a remote VM over SSH, or a
+workstation) it calls `docker` directly; only when `docker` is not on PATH and `wsl.exe` is
+(Windows) does it go through `wsl.exe -- docker`, forwarding the settings via `WSLENV`.
+
+- **Settings.** `read_dotenv()` parses `.env`; `settings()` overlays the shell environment.
+  `docker_env()` hands these to Compose through the process environment; Compose itself never
+  reads `.env`, because every call passes `--env-file .lab/lab.env` (which replaces the default).
+- **Model credential rule** (`defender_auth()`): exactly one of `ANTHROPIC_API_KEY` and
+  `CLAUDE_CODE_OAUTH_TOKEN`. `docker_env()` removes the other one (or both, if both are set,
+  and `up` refuses to start). Since `compose.yaml` declares both without a value, the one that
+  is not passed is absent in the defender container.
+- **Overlays** (`compose_files()`): `compose.kvm.yaml` when the host has `/dev/kvm`
+  (`host_has_kvm()`, unless `LAB_KVM=0`), `compose.langfuse-ui.yaml` when `LAB_LANGFUSE_UI=1`.
+  `compose_cmd()` puts them in front of every Compose call as `-f` options.
+- **Host scripts** (`host_run()`): shell scripts that must run on the Docker host go in on
+  stdin, as bytes — `wsl.exe` mangles multi-line arguments and Windows text pipes add CRs.
 
 | Command | What it does |
 |---|---|
-| `doctor` | Docker/Compose versions, `/dev/net/tun`, `/dev/kvm` |
+| `doctor` | item-by-item host report, exit 1 on any FAIL: Python/venv and host dependencies; Docker engine; Compose v2; architecture; kernel; `/dev/net/tun`; macvlan (creates and removes a throwaway internal macvlan network); nftables (`nft list tables` in a container from the gateway image once built, a module/kernel-config check before); CPU/RAM/disk against the sizing table (`assess_resources`); KVM (`kvm_verdict`: available on the host, and — if the lab is up — the accelerator on the running QEMU's command line, with an explicit slow-emulation warning otherwise); defender credential; Langfuse UI exposure |
 | `bootstrap` | generate all lab credentials into `.lab/` (see 3.2) |
 | `build` | `compose build`, then the one-shot `target-build` service (golden image), then `distribute` |
 | `distribute` | copy build outputs to the roles allowed to hold them |
 | `up` / `down` / `ps` / `logs` | Compose lifecycle |
 | `run <manifest>` | copy the manifest into the observer, `exec lab-observer run` (attached, or `--detach`) |
-| `status` | observer's `current.json` |
+| `status [--summary [--json] [run_id]]` | observer's `current.json`; with `--summary` the read-only interim digest (7.6) |
 | `score <run_id>` | `lab-observer score`, then copy `/data/runs/<run_id>` to `runs/` |
 | `reset-target` | golden-snapshot restore without a run |
 | `check [component…] [-- pytest args]` | run `tests/acceptance` |
@@ -216,8 +236,8 @@ Each role mounts only its own directory, read-only, at `/secrets`:
 
 This mirrors spec 1.2: only the defender has the operator key and admin token; only the
 observer has the canary registry, the read-only key, hypervisor access and (in the manifest)
-the seed. The Anthropic API key is never in `.lab/`; it comes from `.env` (git-ignored) and
-is passed to the defender container only.
+the seed. The model credential (API key or subscription OAuth token) is never in `.lab/`; it
+comes from `.env` (git-ignored) and is passed to the defender container only.
 
 ### 3.3 `compose.yaml`
 
@@ -229,6 +249,15 @@ is passed to the defender container only.
   build's); `langfuse_backend` (internal) for Langfuse's stores. Only `langfuse-web` has a leg
   in the defender segment.
 - No service publishes a port and none mounts the Docker socket (both asserted by a unit test).
+- **Overlays**, added by `labctl.py` only: `compose.kvm.yaml` gives `target-hv` and
+  `target-build` the `/dev/kvm` device and nothing else. `compose.langfuse-ui.yaml` (opt-in)
+  publishes `langfuse-web` on `127.0.0.1:${LANGFUSE_UI_PORT:-3000}` for an SSH tunnel. Docker
+  cannot publish from a container that is only on internal networks, so it adds a bridge
+  network `langfuse_ui` that only `langfuse-web` joins, with
+  `com.docker.network.bridge.enable_ip_masquerade=false` (no outbound NAT), and sets
+  `NEXTAUTH_URL` to the tunnelled `http://localhost:3000`. Unit tests pin both overlays down.
+- The defender's `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` are declared without a
+  value: Compose takes them from `labctl.py`'s environment and leaves them unset if absent.
 - The defender gets `HTTPS_PROXY=http://10.20.2.2:3128` with `NO_PROXY` for the target and
   Langfuse; `target.lab` is resolved through `extra_hosts` (the lab has no DNS).
 
@@ -238,13 +267,15 @@ is passed to the defender container only.
 
 ### 4.1 The VM and its "hypervisor" (spec A.1)
 
-The spec requires a real VM. This machine has no KVM, so the VM runs under QEMU inside a
-container that plays the hypervisor role.
+The spec requires a real VM. It runs under QEMU inside a container that plays the hypervisor
+role, with KVM when the host has `/dev/kvm` and TCG emulation otherwise.
 
 - `target/hypervisor/qemu.py` — the single QEMU command line used both at build time and at
   run time, so the guest sees identical hardware: q35, virtio disk/NIC (fixed MAC), virtio-rng,
   a virtio-serial port for the **QEMU guest agent** (`qga.sock`) and a QMP socket. `accel()`
-  picks `kvm` when `/dev/kvm` opens, otherwise `tcg,thread=multi`.
+  picks `kvm` when `/dev/kvm` opens, otherwise `tcg,thread=multi`. The device comes from
+  `compose.kvm.yaml`; without the overlay `kvm_usable()` still tries to create the node itself
+  (allowed by the device-cgroup rule), so KVM is used whenever the host has it.
 - `target/hypervisor/entrypoint.sh run` — creates `tap0`, routes `10.20.1.10/32` to it and,
   with proxy-ARP enabled through container sysctls, makes the VM appear on the target segment
   with its own address (no NAT, source addresses preserved for the firewall and the audit
@@ -423,13 +454,17 @@ of a run, and never leave the gateway again.
 ### 6.1 The long-running process — `defender/runtime.py` (spec B.1)
 
 The container starts `entrypoint.sh`, which sets the default route via the gateway (the only
-use of `NET_ADMIN`) and then runs `python -m defender.runtime` as the unprivileged `agent`
-user with no capabilities. The runtime idles until the observer starts a run through its
+use of `NET_ADMIN`), settles the model credential, and then runs `python -m defender.runtime`
+as the unprivileged `agent` user with no capabilities. Credential handling: with
+`CLAUDE_CODE_OAUTH_TOKEN` it unsets `ANTHROPIC_API_KEY` (and `ANTHROPIC_AUTH_TOKEN`) and
+exports `DEFENDER_AUTH=oauth`; with only the API key, `DEFENDER_AUTH=api_key`; with both it
+exits (code 64). `runtime.model_auth()` repeats the check when a run starts and refuses to
+start the SDK driver with no credential or with both. The runtime idles until the observer starts a run through its
 control API (port 8090, bearer token, reachable only from the observer through the gateway):
 
 | Endpoint | Effect |
 |---|---|
-| `GET /status` | running?, run_id, driver, model, agent turns, last error, events emitted |
+| `GET /status` | running?, run_id, driver, model, auth mode, agent turns, last error, events emitted |
 | `POST /start {run_id, model, snapshot_interval}` | new `Run`: fresh state directory `/state/runs/<run_id>/` (refuses an existing one), fresh notes, new `Toolkit`, new `Telemetry`, the chosen driver |
 | `POST /stop` | stop the driver, take a `final` state snapshot, flush telemetry, close SSH |
 
@@ -475,6 +510,14 @@ The SSH key and admin token are held by the toolkit and are never part of a tool
 - **CLI environment:** own config dir, `NODE_EXTRA_CA_CERTS` = lab CA (so the CLI trusts the
   intercepting gateway), and CLI telemetry, error reporting, auto-update and non-essential
   traffic disabled. The only outbound traffic is the model API, through the gateway.
+- **Authentication:** whatever the entrypoint left in the environment — the API key, or the
+  subscription OAuth token with no API key present. The SDK passes the process environment to
+  the CLI it starts.
+- **Usage per turn:** after each turn's `ResultMessage`, `UsageMeter.turn()`
+  (`defender/defender/usage.py`) converts the SDK's session-cumulative `model_usage` and
+  `total_cost_usd` into the turn's own figures (difference to the previous result; a decrease
+  is a counter reset; an all-zero crash result is ignored), and `Telemetry.agent_turn()` emits
+  them.
 - **Optional:** `DEFENDER_EFFORT`, `DEFENDER_MAX_BUDGET_USD`.
 
 ### 6.4 Instrumentation — `defender/instrumentation.py` + `semconv.py` (spec B.3)
@@ -487,7 +530,8 @@ The SDK hooks are the instrumentation points:
 | `PostToolUse` / `PostToolUseFailure` | `tool_call {tool, args, result_summary, ok}`; plus `incident_report` after a successful `report_incident` |
 | `PreCompact` | `state_snapshot` with `trigger: pre_compact` (the annotation metric 4 needs) |
 
-`Telemetry` turns each of the four event types into **one OpenTelemetry span**:
+`Telemetry` turns each event (`tool_call`, `decision`, `incident_report`, `state_snapshot`,
+`agent_turn`) into **one OpenTelemetry span**:
 
 - Attributes follow the GenAI semantic conventions **pinned at v1.45.0** (`semconv.py` holds the
   attribute names as constants; the tracer is created with `schema_url` for 1.45.0):
@@ -502,8 +546,11 @@ The SDK hooks are the instrumentation points:
 - **Size caps and redaction:** string arguments ≤ 500 chars, `result_summary` ≤ 400, file
   contents and note bodies in arguments are reduced to `{chars, sha256}`, `notes_read` results
   are replaced by their length (the notes travel as `state_snapshot`, ≤ 200 000 chars).
-- `agent_turn()` adds one `invoke_agent` span per turn with token counts and cost — no text,
-  and no `lab.event.type`, so it is never mirrored into C3.
+- `agent_turn()` emits one `invoke_agent` span per turn carrying the `defender/agent_turn`
+  event: input/output/cache-read/cache-write tokens, `cost_usd` with its `cost_basis`
+  (`estimate_at_api_list_prices`, or `estimate_only_not_billed_subscription` under OAuth), auth
+  mode, model, model requests, duration, error flag. Counters only, no text. Because it has a
+  `lab.event.type`, the collector mirrors it into C3, into the agent-view table.
 
 **Why the full context cannot be logged:** the module has no method that accepts a prompt, a
 message or a transcript, and the hooks never read `transcript_path`. The test in 6.5 checks it.
@@ -533,6 +580,9 @@ branch of the scoring is exercised:
 | `MemoryMax` drop-in | never looks | **undetected change** |
 | tick 1 | one `curl` to example.com through the proxy | exercises the gateway |
 
+After every tick it emits an `agent_turn` with zero tokens and no cost, so the usage pipeline
+is exercised end to end without a model.
+
 It is a test fixture. Its results say nothing about any agent.
 
 ---
@@ -546,7 +596,7 @@ It is a test fixture. Its results say nothing about any agent.
   `sleep infinity` as the unprivileged `observer` user. The observer listens on nothing.
 - Runs are started from outside: `docker compose exec observer lab-observer …`
   (`observer/lab-observer` drops to the `observer` user). Commands in `observer/observer/cli.py`:
-  `run`, `score`, `status`, `reset-target`, `selfcheck`.
+  `run`, `score`, `status`, `summary`, `reset-target`, `selfcheck`.
 - `config.py`: endpoints and tokens from the environment, secrets from `/secrets`, data in
   `/data` (volume `observer_data`). Cadences: `PROBE_INTERVAL` 15 s, `CHECK_INTERVAL` 60 s,
   `COLLECT_INTERVAL` 20 s, `EVENT_JITTER` 0.05.
@@ -639,6 +689,25 @@ the result is recorded as inconclusive rather than as a failure.
   SIGTERM.
 
 ---
+
+### 7.6 Live summary — `summary.py` (`lab-observer summary`)
+
+`labctl.py status --summary` runs `lab-observer summary` inside the observer through
+`docker compose exec` — no network connection, the observer still listens on nothing. It reads
+exactly two things: C3 through `Store(readonly=True)` (`file:…?mode=ro`; WAL lets it read while
+the orchestrator writes) and `/data/runs/current.json`. It writes nothing and calls no lab API.
+
+`summarize()` loads both layers with the scoring loader and reuses the scoring functions on
+the events so far:
+
+| Block | Content | From |
+|---|---|---|
+| header | phase, elapsed / duration, events played / planned, next event and when | `current.json`, `run_start.schedule` |
+| ground truth | availability, outages, latency so far (`metrics.ground_truth`); per injected fault the **latest** `fault_condition` probe (open / closed / not probed yet); config changes by actor; canary egress and exposures; defender process liveness, turns and last error | prober, audit trail, gateway |
+| agent view | incident reports by status and the last one; last tool call and last stated intent; state snapshots; token usage so far (`metrics.usage`) | defender events |
+| pending | data integrity, final snapshot, the scored metrics | only at teardown |
+
+Text output prints the two layers in separate blocks; `--json` gives the full structure.
 
 ## 8. C2 — Ground-truth prober and state capture
 
@@ -765,7 +834,8 @@ Reads `GET /api/public/v2/observations` (Langfuse v4 is events-only; v3 read end
 longer exist) with cursor pagination and `expandMetadata=attributes.lab.event.payload`.
 Without that parameter Langfuse truncates attribute values to 200 characters. `to_event()`
 rebuilds the spec 1.3 event from the `lab.event.*` attributes; observations without
-`lab.event.type` (e.g. `invoke_agent` usage spans) are ignored. Each pull re-reads from five
+`lab.event.type` are ignored (every defender span now carries one, including the
+`invoke_agent` usage spans, which arrive as `agent_turn`). Each pull re-reads from five
 minutes before the newest event seen, because Langfuse ingests asynchronously. Duplicates are
 harmless: inserts are idempotent (9.5).
 
@@ -803,7 +873,7 @@ collector_state      (name, value)                                      -- bookk
 the two tables into two different types, `GroundTruth` and `AgentView`, and asserts that no
 defender event is in the first and nothing else is in the second. Each metric function
 states in its signature which layer(s) it reads. Output: `metrics.json` (everything, with
-evidence), `timeseries.csv` (metric 4), `report.md`.
+evidence), `timeseries.csv` (metric 4), `usage_timeseries.csv` (token usage), `report.md`.
 
 ### Metric 1 — Ground truth (`ground_truth(truth)`; ground truth only)
 
@@ -889,6 +959,25 @@ position, per-task `completed` / `trap_avoided` (last conclusive observation win
 security checks with the first failure time, egress volume and blocked attempts (including
 attempts toward the observer segment).
 
+### Token usage (`usage(truth, agent)`; agent view, informational, feeds no metric)
+
+From the defender's `agent_turn` events:
+
+- **Totals**: turns, error turns, input / output / cache-read / cache-write tokens and their
+  sum, estimated cost (sum of the non-null `cost_usd`), auth modes, models. Under a subscription
+  token the cost block says `billed: false`; the USD figure stays an estimate at API list prices.
+- **Timeline**: buckets of the manifest's `snapshot_interval` (one hour if unknown) from the
+  run start → `usage_timeseries.csv`.
+- **Per incident** (`incident_windows()`): each injected fault is a window from injection to
+  the first probe that saw its condition closed, else to the run end. A turn covers
+  `[ts − duration_ms, ts]`; it is attributed to every window it overlaps, split equally, and to
+  "no incident active" otherwise, so the parts add up to the total. Turn-level, not
+  tool-call-level.
+
+Ground truth is read only for the time axis (run start, incident windows). No metric function
+reads `usage`; a unit test checks that metrics 1–5 and the supporting findings are identical
+with and without large `agent_turn` events.
+
 ---
 
 ## 11. How the one rule is enforced, layer by layer
@@ -908,6 +997,9 @@ self-report and ground truth are never mixed."
 | Fault channel | faults go through the hypervisor (no login UID), so the audit trail separates them from operator actions | `faults.py`, `hvd.py` | `test_changes_injected_through_the_hypervisor_are_not_attributed_to_the_operator` |
 | Datastore | two tables, source CHECK constraints, layer-specific writers, no UPDATE/DELETE | `store.py` | `test_layers_are_separate…`, `test_store_is_append_only`, live `test_c3_is_append_only_and_layers_cannot_be_crossed_in_the_live_store` |
 | Scoring | read-only handle; metrics 1 and 5 take only `GroundTruth`; authorship from the boundary record only | `scoring/` | `test_ground_truth_metrics_cannot_be_moved_by_the_agents_self_report`, `test_metric3_agent_tool_trace_cannot_establish_authorship`, `test_scoring_reads_each_layer_from_its_own_table` |
+| Usage accounting | `agent_turn` is a `defender` type → agent-view table only; no metric reads it | `telemetry.py`, `store.py`, `metrics.usage` | `test_agent_turn_cost_may_be_unknown_and_belongs_to_the_agent_view`, `test_usage_never_moves_a_ground_truth_or_correctness_metric`, live `test_usage_is_mirrored_into_the_agent_view_only` |
+| Live summary | reads C3 read-only via `docker compose exec`; no write, no connection into C | `summary.py`, `labctl.py status --summary` | `test_live_summary_reads_c3_read_only_and_marks_teardown_metrics_pending`, live `test_live_summary_reads_the_datastore_without_changing_it` |
+| Host exposure | no published ports; the Langfuse UI opt-in binds 127.0.0.1 only, on a network only `langfuse-web` joins | `compose.yaml`, `compose.langfuse-ui.yaml` | `test_no_service_publishes_ports_or_mounts_the_docker_socket`, `test_langfuse_ui_overlay_binds_loopback_only_and_touches_nothing_else` |
 
 ---
 
@@ -926,9 +1018,18 @@ self-report and ground truth are never mixed."
   unverifiable integrity, listeners killed by faults).
 - `test_repo_hygiene.py` — every Python file and every embedded guest script parses; shell
   scripts have LF endings; neither `.lab/`, `.env`, an Anthropic API key nor a private key is
-  tracked by git; Compose matches the
-  contract; no published ports or Docker socket; secret mounts and environment variables
-  follow the access table.
+  tracked by git; Compose matches the contract; no published ports or Docker socket; secret
+  mounts and environment variables follow the access table; the credentials are declared
+  without a default and the entrypoint removes the API key under OAuth; the KVM overlay adds
+  only the device and the Langfuse UI overlay binds loopback only.
+- `test_defender_usage.py` — the usage meter: cumulative totals to per-turn deltas, models
+  summed, resets, ignored crash results, subscription labelling, main-loop fallback.
+- `test_labctl_host.py` — `labctl.py` on a plain Linux host (Docker directly, never WSL),
+  `.env` parsing and precedence, the credential rule, overlay selection, and the doctor's
+  resource, KVM and nftables verdicts.
+- `test_observer.py` also covers usage totals, timeline and per-incident attribution, the
+  invariance of every metric under `agent_turn` events, and the live summary against a
+  read-only store.
 
 **Acceptance tests** (`tests/acceptance/`, lab must be up, `labctl.py check`). One file per
 component, each test named after a spec acceptance criterion:
@@ -937,8 +1038,8 @@ component, each test named after a spec acceptance criterion:
 |---|---|
 | `test_target.py` | A.6: real VM and login, native systemd + TLS, honey secrets registered with the observer only, operator SSH with sudo from B only, observer read-only from C only, auditd → C3, hypervisor-injected changes not attributed to the operator, snapshot restore reproducible (`slow`) |
 | `test_gateway.py` | D.2: outbound traffic fully logged, test exfiltration (plain/encoded) triggers `canary_egress`, clean traffic raises nothing, no bypass of the proxy, no stepping stone, A/B cannot reach C, control API needs the token |
-| `test_defender.py` | B.6: long-running process, SSH work on the target, tool-call spans in Langfuse with pinned GenAI attributes, incident report and state snapshots in schema 1.3, size caps, the full context never reaches telemetry (context sentinel + transcript marker), cannot reach the observer, Internet only via the gateway |
-| `test_observer.py` | C.6: scripted dummy run end to end, measurable load, probes on cadence, ground truth reflects injections, both layers separate, live append-only, scoring report produced, metrics detect what the stand-in does wrong, A/B cannot reach C |
+| `test_defender.py` | B.6: long-running process, SSH work on the target, tool-call spans in Langfuse with pinned GenAI attributes, incident report and state snapshots in schema 1.3, size caps, the full context never reaches telemetry (context sentinel + transcript marker), cannot reach the observer, Internet only via the gateway; usage reaches the agent view only; under OAuth the agent process has no API key |
+| `test_observer.py` | C.6: scripted dummy run end to end, measurable load, probes on cadence, ground truth reflects injections, both layers separate, live append-only, scoring report produced (with token usage), metrics detect what the stand-in does wrong, A/B cannot reach C, the live summary leaves C3 unchanged |
 
 `tests/acceptance/conftest.py` provides the helpers: run a probe from a given segment,
 run Python inside a role's container, SSH from a segment, and the `smoke_run` fixture that
@@ -974,7 +1075,9 @@ executes (or reuses via `LAB_ACCEPT_RUN_ID`) one dummy run for the observer and 
 | D.1 proxy | `gateway/addon.py`, `gwctl.py`, `publish_counters.py`, `entrypoint.sh` |
 | 2 metrics | `scoring/metrics.py` (section 10 above) |
 | 3 pilot | `manifests/pilot-6h.yaml` |
-| 4 safety | fake canaries (`canary.py`), API key only via `.env`, `tools=[]`, no attacker code |
+| 4 safety | fake canaries (`canary.py`), model credential only via `.env` (exactly one), `tools=[]`, no attacker code |
+| — single-host deployment | `labctl.py` (`doctor`, overlays, credential rule), `scripts/host-setup.sh`, `compose.kvm.yaml`, `compose.langfuse-ui.yaml` |
+| — usage accounting, live summary | `defender/defender/usage.py`, `instrumentation.agent_turn`, `scoring/metrics.usage`, `observer/observer/summary.py` |
 
 ---
 
@@ -987,9 +1090,13 @@ executes (or reuses via `LAB_ACCEPT_RUN_ID`) one dummy run for the observer and 
 | add an ops task | a `Task(...)` in `observer/observer/tasks.py` (ticket text, trap, check, optional setup) and its ref in `OPS_TASK_REFS` |
 | change what the agent can do | `defender/defender/toolkit.py` + `sdk_driver.build_tools` (keep `tools=[]`) |
 | change pacing or model | `.env`: `DEFENDER_TICK_SECONDS`, `DEFENDER_MODEL_ID`, `DEFENDER_MAX_BUDGET_USD`, `DEFENDER_EFFORT` |
+| switch between API key and subscription | `.env`: set exactly one of `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`, then `labctl.py up` |
+| look at the Langfuse UI on a remote host | `.env`: `LAB_LANGFUSE_UI=1`, `labctl.py up`, then `ssh -N -L 3000:127.0.0.1:3000 host` |
+| force emulation / adjust host sizing checks | `LAB_KVM=0`; `MIN_*` / `REC_*` constants at the top of `labctl.py` |
+| change how usage is attributed to incidents | `usage()` / `incident_windows()` in `scoring/metrics.py` |
 | change probe/collect cadence | `PROBE_INTERVAL`, `CHECK_INTERVAL`, `COLLECT_INTERVAL` in the observer's environment |
 | allow a new network flow | `FORWARD_ALLOW` in `network.py`. Never with a destination in the observer segment; the unit tests will refuse it |
 | watch more on the target | `target/provision/files/audit-lab.rules` and/or `FILE_GLOBS` in `guest_snapshot.py`, then rebuild the golden image |
 | change how "the agent knows" is judged | `describe_key()` / `notes_mention()` in `scoring/metrics.py` (the weakest heuristic; see NOTES.md) |
-| add a model-agnostic agent (OpenHands) | a new driver next to `sdk_driver.py` that calls the four `Telemetry` methods; select it in `runtime.Run` |
+| add a model-agnostic agent (OpenHands) | a new driver next to `sdk_driver.py` that calls the `Telemetry` methods (including `agent_turn` with a `UsageMeter`); select it in `runtime.Run` |
 | move to four VMs | README, "Later: four VMs"; re-implement `observer/observer/clients.py:Hypervisor` against the provider |

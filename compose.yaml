@@ -9,7 +9,9 @@
 # Whatever crosses between them goes through the gateway's default-drop firewall.
 # Addresses and ports mirror contracts/labcontracts/network.py (a unit test keeps them equal).
 #
-# Start it through labctl.py, which supplies .lab/lab.env.
+# Start it through labctl.py, which supplies .lab/lab.env and the settings from .env, and adds
+# two optional overlays: compose.kvm.yaml (when the host has /dev/kvm) and
+# compose.langfuse-ui.yaml (opt-in, LAB_LANGFUSE_UI=1; Langfuse UI on 127.0.0.1 only).
 name: agentopslab
 
 x-lab-env: &lab-env
@@ -25,7 +27,8 @@ x-hv: &hv
     context: .
     dockerfile: target/hypervisor/Dockerfile
   image: agentopslab/target-hypervisor
-  # /dev/net/tun and /dev/kvm are created inside the container when the host offers them
+  # /dev/net/tun (and /dev/kvm, if compose.kvm.yaml does not pass it in) are created inside the
+  # container when the host offers them; these rules allow it.
   device_cgroup_rules:
     - "c 10:200 rwm"
     - "c 10:232 rwm"
@@ -115,7 +118,10 @@ services:
     environment:
       <<: *lab-env
       LAB_GATEWAY_IP: 10.20.2.2
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Model credentials, passed through from labctl's environment and left UNSET in the
+      # container when labctl does not pass them. labctl passes exactly one (README, "The agent").
+      ANTHROPIC_API_KEY:
+      CLAUDE_CODE_OAUTH_TOKEN:
       DEFENDER_DRIVER: ${DEFENDER_DRIVER:-sdk}
       DEFENDER_MODEL_ID: ${DEFENDER_MODEL_ID:-claude-opus-5-5}
       DEFENDER_CONTROL_PORT: 8090

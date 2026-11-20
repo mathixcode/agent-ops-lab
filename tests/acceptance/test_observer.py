@@ -261,3 +261,28 @@ import subprocess as sp
 listeners = [l.split()[3] for l in sp.run(["ss", "-Htln"], capture_output=True, text=True).stdout.splitlines()]
 out({"non_loopback_listeners": [l for l in listeners if not l.startswith(("127.", "[::1]")) and not l.endswith(":9999")]})''')
     assert own_firewall["non_loopback_listeners"] == [], "the observer must not run any network service"
+
+
+def test_live_summary_reads_the_datastore_without_changing_it(smoke_run):
+    """`lab-observer summary` (labctl.py status --summary): read-only digest from C3 and current.json."""
+    from conftest import compose
+    rid = smoke_run["run_id"]
+    count = 'import sqlite3; db = sqlite3.connect("file:/data/c3/lab.sqlite?mode=ro", uri=True); ' \
+            'out([db.execute("SELECT COUNT(*) FROM " + t).fetchone()[0] for t in ("agent_view_events", "ground_truth_events")])'
+    before = role_py("observer", count)
+    proc = compose("exec", "-T", "observer", "lab-observer", "summary", "--json", rid)
+    assert proc.returncode == 0, proc.stderr[-1000:]
+    digest = json.loads(proc.stdout)
+    assert role_py("observer", count) == before
+    assert digest["run_id"] == rid
+    assert digest["ground_truth"]["availability_so_far"]["probes"] > 0
+    assert digest["agent_view"]["usage"]["turns"] > 0 and digest["agent_view"]["usage"]["layer"] == "agent_view"
+    assert digest["ground_truth"]["final_snapshot"] == "taken"       # a finished run: nothing pending
+
+
+def test_scoring_reports_token_usage_from_the_agent_view(smoke_run):
+    metrics = json.loads((Path(smoke_run["dir"]) / "report/metrics.json").read_text(encoding="utf-8"))["metrics"]
+    u = metrics["usage"]
+    assert u["layer"] == "agent_view" and u["turns"] > 0
+    assert (Path(smoke_run["dir"]) / "report/usage_timeseries.csv").exists()
+    assert "Token usage" in (Path(smoke_run["dir"]) / "report/report.md").read_text(encoding="utf-8")

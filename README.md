@@ -12,9 +12,10 @@ the agent *says* happened with what *independently measurably* happened.
 | **C — Observer** | Orchestrator, load generator, independent prober, append-only datastore, offline scoring | `10.20.9.10` |
 | **D — Gateway** | The lab's only router and firewall, and the logging egress proxy with canary detection | `.2` on each segment |
 
-This repository is the **local pilot**: everything runs on one machine with Docker Compose.
-There is no attacker and no exploit code; stress comes from load, operational faults, ops
-tasks and the agent's own actions. Cloud deployment is not part of it (see the end).
+Everything runs on **one Docker host** with Docker Compose: a remote Linux VM or server over
+SSH (the intended setup for long runs), or a workstation. There is no attacker and no exploit
+code; stress comes from load, operational faults, ops tasks and the agent's own actions. The
+lab is provider-agnostic: nothing in it depends on a particular cloud or hosting company.
 
 ## The one rule
 
@@ -32,26 +33,80 @@ In this repository that means:
   from landing in the wrong one, and triggers that reject every UPDATE and DELETE.
 - **Scoring.** Availability, data integrity and collateral downtime are computed from ground
   truth alone. Where the agent's view is used, it is only compared *against* ground truth.
+  The agent's token/cost accounting is agent view too and feeds no metric.
 
-Each of these has an automated check (`tests/`).
+No lab service publishes a port on the host. The one exception is opt-in (the Langfuse UI,
+loopback only, see "Reading results"). Each of these has an automated check (`tests/`).
 
 ## Requirements
 
-- Docker Engine with Compose v2 on Linux, or inside WSL2 on Windows
-- about 12 GB of free RAM and 15 GB of disk
+- Linux with Docker Engine and the Compose v2 plugin (Debian/Ubuntu: `scripts/host-setup.sh`
+  installs everything), or Windows with Docker inside WSL2
+- kernel support for `/dev/net/tun`, macvlan and nftables (any stock Debian/Ubuntu kernel)
+- `/dev/kvm` for realistic speed (see "KVM" below); without it the lab still works, slowly
 - the project's Python virtualenv (`.venv/`) for the host CLI and the tests
 - Internet access for the image build (afterwards the lab only goes out through its gateway)
-- optional: `/dev/kvm`. Without it the target VM runs under software emulation, which works
-  but is slower (boot ~40 s, golden-image build ~10 min, API calls a few hundred ms)
 
-All commands below are run from the repository root with the virtualenv's interpreter —
-written as `python` here; on Windows that is `.venv\Scripts\python.exe`, on Linux
-`.venv/bin/python`.
+### Host sizing
 
-## Running the local pilot
+For the full stack — target VM, gateway, defender, observer with load generator, and Langfuse
+with its ClickHouse, PostgreSQL, Redis and MinIO:
+
+| | vCPU | RAM | Disk | Target VM setting |
+|---|---|---|---|---|
+| Minimum | 6 | 16 GB | 60 GB free | `TARGET_VCPUS=2`, `TARGET_MEMORY_MB=4096` |
+| Recommended | 8+ | 32 GB | 100 GB free | defaults (4 vCPU, 8 GB, 40 GB disk) |
+
+Roughly: the target VM takes what you give it, Langfuse ~4 GB RAM and 1–2 cores under load,
+the defender (Claude Code CLI) ~1 GB, observer plus load generator ~1 GB, gateway ~0.5 GB.
+Long runs grow the Langfuse volumes (traces) and the target's copy-on-write disk.
+`labctl.py doctor` checks the host against these numbers.
+
+### KVM
+
+The target is a full VM. With `/dev/kvm` on the host, `labctl.py` adds `compose.kvm.yaml`,
+which passes the device into the hypervisor container, and QEMU runs with KVM. Without it QEMU
+falls back to TCG software emulation: still a real VM, but several times slower (boot ~40 s,
+golden-image build ~10 min, API calls a few hundred ms; latency numbers are not comparable
+with KVM runs). That is fine
+for smoke tests; **long-horizon runs want a KVM-capable host**, such as a dedicated or
+bare-metal server (for example a Hetzner dedicated server). Most shared cloud VMs do not
+expose nested virtualisation; check with `labctl.py doctor`, which says explicitly whether KVM
+is available and whether the running target VM actually uses it. `LAB_KVM=0` forces TCG.
+
+## Running on a remote Linux host (headless, over SSH)
 
 ```sh
-python -m pip install -r requirements-dev.txt    # once: host CLI and test dependencies
+ssh you@your-host
+git clone <your repository> agent-ops-lab && cd agent-ops-lab
+sudo scripts/host-setup.sh      # Docker + Compose plugin, kernel modules, .venv, then doctor
+exit; ssh you@your-host         # log in again so the docker group membership applies
+cd agent-ops-lab
+
+.venv/bin/python labctl.py doctor        # every item should be ok; read the WARN lines
+cp .env.example .env && nano .env        # the model credential, see "The agent"
+.venv/bin/python labctl.py bootstrap
+.venv/bin/python labctl.py build         # images + golden snapshot (minutes with KVM)
+.venv/bin/python labctl.py up
+.venv/bin/python labctl.py run manifests/smoke.yaml --detach
+.venv/bin/python labctl.py status --summary     # any time, from any SSH session
+```
+
+`host-setup.sh` supports Debian and Ubuntu; on another distribution install Docker Engine,
+the Compose plugin and `python3-venv` by hand and run `doctor`. It opens no ports and changes
+no firewall rules. Use `--detach` for anything longer than a coffee break: the run then lives
+in the observer container and survives your SSH session (or use `tmux`/`screen` and run
+attached).
+
+## Running the lab
+
+All commands are run from the repository root with the virtualenv's interpreter — written
+as `python` below; that is `.venv/bin/python` on Linux and `.venv\Scripts\python.exe` on
+Windows. `labctl.py` uses `docker` directly when it is on PATH; only on Windows without it
+does it go through `wsl.exe`.
+
+```sh
+python -m pip install -r requirements-dev.txt    # once (host-setup.sh does this on Linux)
 
 python labctl.py doctor       # can this host run the lab?
 python labctl.py bootstrap    # generate lab-only keys, CA and fake canaries into .lab/
@@ -62,23 +117,61 @@ python labctl.py run manifests/smoke.yaml     # 16-minute scripted dummy run
 python labctl.py score smoke-001              # metrics report -> runs/smoke-001/report/
 ```
 
-`labctl.py run` stays attached and prints the orchestrator's log. Every run needs a new
-`run_id` (edit the manifest): the datastore is append-only and refuses to reuse one.
+`labctl.py run` stays attached and prints the orchestrator's log; `--detach` leaves it running
+in the background. Every run needs a new `run_id` (edit the manifest): the datastore is
+append-only and refuses to reuse one.
 
 A run does this: stop the agent → restore the target from the golden snapshot → take the
 baseline ground-truth snapshot → start the agent → play load and the seeded event schedule
 while probing and collecting → stop the agent → final snapshot and integrity check → export.
 
+### Following a run: `status --summary`
+
+```sh
+python labctl.py status                  # phase and counters (current.json)
+python labctl.py status --summary        # interim digest of the run so far
+python labctl.py status --summary --json [run_id]
+```
+
+The summary opens the datastore **read-only** and reads the orchestrator's `current.json`;
+it writes nothing, does not touch the running lab and opens no connection into the observer
+(it runs inside it through `docker compose exec`). It shows elapsed time and position in the
+schedule, availability and latency so far, injected incidents with the latest fault-condition
+probe (still open / closed), config changes from the audit trail, canary hits, defender
+liveness and turns, the agent's incident reports and last action, and token usage so far.
+Ground truth and agent view are printed in separate blocks. What needs teardown — the final
+snapshot, the integrity check, the scored metrics — is shown as *pending*.
+
 ### The agent, and running without one
 
-Put the API key in `.env` (git-ignored; copy `.env.example`). It reaches the defender
-container only and is never written to the repository or to telemetry.
+The defender authenticates the Claude Agent SDK with **exactly one** of two credentials, set
+in `.env` (git-ignored; copy `.env.example`):
+
+| | `.env` | Billing |
+|---|---|---|
+| API key | `ANTHROPIC_API_KEY=...` | per token, through the Anthropic API |
+| Subscription | `CLAUDE_CODE_OAUTH_TOKEN=...` from `claude setup-token` | your Claude subscription |
 
 ```
-ANTHROPIC_API_KEY=...
 DEFENDER_DRIVER=sdk            # the Claude Agent SDK agent (default)
 DEFENDER_MODEL_ID=claude-opus-5-5
 ```
+
+`labctl.py` passes only the one that is set to Compose, and the defender's environment
+declares both without a default, so the other one is *absent* in the container, not empty.
+With the OAuth token, `ANTHROPIC_API_KEY` therefore does not exist in the defender container
+or the agent process, and the CLI cannot fall back to API billing; the entrypoint removes it
+once more and the runtime refuses to start if both are set. `labctl.py up` refuses as well.
+The credential reaches the defender container only and is never written to the repository
+or to telemetry.
+
+**Subscription caveat for long runs.** Subscription plans have usage limits (rolling windows
+and weekly caps). A multi-hour or multi-day run with a check-in every five minutes can reach
+them. When it does, the agent's turns fail with a rate-limit error until the window resets:
+the defender keeps running and retries at the next check-in, the error appears as
+`driver_error` in the ground-truth liveness checks (and in `status --summary`), and the gap
+shows in the metrics as an agent that did not act. For long runs prefer an API key, or raise
+`DEFENDER_TICK_SECONDS`. Check that your plan's terms allow this kind of automated use.
 
 `DEFENDER_DRIVER=scripted` replaces the agent with a deterministic stand-in that needs no
 model. It exists only to prove the harness end to end: it drives the same tools and the same
@@ -90,30 +183,54 @@ After changing `.env`, run `python labctl.py up` again.
 ### The 6-hour pilot (spec Section 3)
 
 ```sh
-python labctl.py run manifests/pilot-6h.yaml
+python labctl.py run manifests/pilot-6h.yaml --detach
+python labctl.py status --summary
 python labctl.py score pilot-6h-001
 ```
 
 Seven events over six hours (four faults, three ops tasks), snapshots every 30 minutes.
-Use `--detach` to leave it running and `python labctl.py status` to follow it.
 
 **On Windows/WSL2:** WSL shuts its VM down — and Docker and the whole lab with it — shortly
 after the last `wsl.exe` process exits. An attached `labctl.py run` keeps it alive; a detached
 run does not. For long or detached runs set `vmIdleTimeout=-1` under `[wsl2]` in
-`%UserProfile%\.wslconfig`, or keep a WSL terminal open for the duration.
+`%UserProfile%\.wslconfig`, or keep a WSL terminal open for the duration. A Linux host has no
+such problem.
 
-### Reading the results
+## Reading results
 
-`runs/<run_id>/` contains
+`python labctl.py score <run_id>` writes the report into the observer and copies it to
+`runs/<run_id>/` on the Docker host:
 
 | File | Content |
 |---|---|
-| `report/report.md` | The five metrics of spec Section 2, readable |
+| `report/report.md` | The five metrics of spec Section 2, readable, plus token usage |
 | `report/metrics.json` | The same in full, with the evidence behind every verdict |
 | `report/timeseries.csv` | Metric 4: the epistemic gap over run length, one row per state snapshot |
+| `report/usage_timeseries.csv` | Tokens and estimated cost per time bucket (agent view) |
 | `events/agent_view.jsonl` | The defender's self-report, spec 1.3 JSON Lines |
 | `events/ground_truth.jsonl` | The independent record, spec 1.3 JSON Lines |
 | `orchestrator.log`, `loadgen.log` | Run logs |
+
+**From a remote host**, copy the directory to your machine:
+
+```sh
+scp -r you@your-host:agent-ops-lab/runs/pilot-6h-001 .
+rsync -av you@your-host:agent-ops-lab/runs/ ./runs/      # or all runs, incrementally
+```
+
+**The Langfuse UI** (the defender's traces) is not reachable from outside the lab by default.
+To look at it, set `LAB_LANGFUSE_UI=1` in `.env` and run `labctl.py up`. This adds
+`compose.langfuse-ui.yaml`, which publishes the UI on the host's **127.0.0.1:3000 only**
+(never on a public interface; `LANGFUSE_UI_PORT` changes the host port). Then tunnel to it:
+
+```sh
+ssh -N -L 3000:127.0.0.1:3000 you@your-host      # then open http://localhost:3000
+```
+
+Log in as `lab@agent-ops-lab.invalid` with `LANGFUSE_INIT_USER_PASSWORD` from `.lab/lab.env`.
+Publishing a port needs a non-internal network, so with the opt-in `langfuse-web` gets one
+extra leg: a bridge network that only it joins, with outbound NAT switched off. The lab's
+segments are unchanged. Remove the setting and run `up` again to close it.
 
 The metrics:
 
@@ -125,6 +242,13 @@ The metrics:
    change, per the audit trail) and *undetected change* (it did not).
 4. **Epistemic gap** — 2 and 3 as a time series, annotated with context-compaction events.
 5. **Collateral** — downtime attributed to the defender's own actions vs. to injected faults.
+
+Alongside them, **token usage** (agent view, informational): total input, output and
+cache tokens and estimated cost for the run, a breakdown over time, and a per-incident figure.
+It is accounted **per agent turn** (one check-in), not per tool call: a turn counts toward
+every injected incident whose window overlaps it, split equally when several do. The USD
+figure is the SDK's estimate at API list prices; under a subscription token nothing is billed
+per token, so the token counts are the primary number.
 
 ## Run manifest
 
@@ -164,25 +288,30 @@ VM twice.
 ## Other commands
 
 ```
-python labctl.py ps | logs [service…] | status
+python labctl.py ps | logs [service…] | status [--summary]
 python labctl.py reset-target             # restore the target from the golden snapshot
 python labctl.py build --rebuild-golden   # rebuild the golden snapshot (after changing target/)
 python labctl.py down [-v]                # stop; -v also deletes images, datastore and traces
 python labctl.py bootstrap --force        # new keys and canaries (then rebuild the golden snapshot)
 ```
 
+Always go through `labctl.py` rather than calling `docker compose` yourself: it supplies
+`.lab/lab.env`, the settings from `.env`, the credential rule and the overlays.
+
 ## Layout
 
 ```
 contracts/     Section 1 as code: network plan, telemetry schema, run manifest, canaries
 target/        A: hypervisor container, provisioning script, seeding, golden-image build
-defender/      B: SDK agent, operator toolkit, instrumentation, scripted stand-in
-observer/      C: orchestrator, faults, ops tasks, load generator, prober, collectors, store, scoring
+defender/      B: SDK agent, operator toolkit, instrumentation, usage accounting, scripted stand-in
+observer/      C: orchestrator, faults, ops tasks, load generator, prober, collectors, store,
+               scoring, live summary
 gateway/       D: firewall rules, proxy addon, control API
 manifests/     smoke.yaml, pilot-6h.yaml
+scripts/       host-setup.sh — prepare a fresh Debian/Ubuntu host
 tests/         unit/ and acceptance/
 labctl.py      host CLI
-compose.yaml   the lab
+compose.yaml   the lab; compose.kvm.yaml and compose.langfuse-ui.yaml are optional overlays
 ```
 
 `BUILD_PLAN.md` records the design decisions; `NOTES.md` the assumptions, limitations and
@@ -190,8 +319,9 @@ open questions; `IMPLEMENTATION.md` explains how every component is implemented,
 
 ## Later: four VMs
 
-Nothing in the components depends on Docker or on a provider; they meet only through the
-Section 1 contracts. Moving to one VM per role would require:
+This repository deliberately keeps everything on one host. Nothing in the components depends
+on Docker or on a provider, though; they meet only through the Section 1 contracts. Moving to
+one VM per role would require:
 
 - **Network.** A private network with the three segments (or equivalent firewall groups) and
   the rules in `contracts/labcontracts/network.py`. `gateway/render_nft.py` already renders
