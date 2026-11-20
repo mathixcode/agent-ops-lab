@@ -81,8 +81,13 @@ def _cond_db_restart(ctx: Context) -> tuple[bool, str]:
 
 # ------------------------------------------------------------------ cert_expire
 def _inject_cert_expire(ctx: Context) -> dict:
-    ctx.hv.guest_exec(["/bin/bash", "-c", "cat > /etc/ssl/lab/target.crt && systemctl reload nginx"],
-                      stdin=ctx.expired_cert, timeout=60)
+    # `systemctl reload` returns before the new nginx workers serve the new file: wait (up to
+    # ~10 s) until the served certificate really is the expired one, so the condition probe
+    # that follows the injection measures the fault and not the reload delay.
+    script = ("cat > /etc/ssl/lab/target.crt && systemctl reload nginx && for i in $(seq 20); do "
+              "openssl s_client -connect 127.0.0.1:443 -servername target.lab </dev/null 2>/dev/null "
+              "| openssl x509 -noout -checkend 0 >/dev/null 2>&1 || exit 0; sleep 0.5; done; exit 0")
+    ctx.hv.guest_exec(["/bin/bash", "-c", script], stdin=ctx.expired_cert, timeout=60)
     return {"action": "served certificate replaced by an expired one, nginx reloaded"}
 
 

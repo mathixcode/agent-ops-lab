@@ -97,7 +97,8 @@ def test_incident_reports_and_state_snapshots_follow_schema_1_3(smoke_run):
     agent = smoke_run["agent"]
     for event in agent:
         telemetry.validate_event(event)
-    assert {e["type"] for e in agent} == {"tool_call", "decision", "incident_report", "state_snapshot"}
+    assert {e["type"] for e in agent} == {"tool_call", "decision", "incident_report", "state_snapshot",
+                                         "agent_turn"}
     reports = of(agent, "incident_report")
     assert reports, "at least one incident_report"
     for r in reports:

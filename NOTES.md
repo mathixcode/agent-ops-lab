@@ -7,7 +7,16 @@ Companion to `BUILD_PLAN.md` (design decisions) and `README.md` (how to run it).
 - **Exercised end to end on this machine:** all four components, with the *scripted stand-in*
   as the defender. Target build, snapshot restore, every fault mechanism, ticket filing, load,
   probing, collection through Langfuse, datastore, scoring. The acceptance suite
-  (`labctl.py check`) passes: 40 checks, 1 skipped (it only applies with the SDK driver).
+  (`labctl.py check`) passed: 40 checks, 1 skipped (it only applies with the SDK driver).
+- **After the 2026-11-20 changes** (remote-host support, OAuth, usage accounting, live
+  summary): 136 unit tests pass. Full acceptance run with KVM active: 40 passed, 2 skipped (SDK
+  driver / OAuth token not configured), 3 failed — two outdated exact-set assertions (fixed)
+  and the `cert_expire` probe race (see "Remote single-host deployment"). The re-run of the
+  observer and defender checks then passed 19, with `cert_expire` still failing because of the
+  nginx reload delay; the injection now waits for the served certificate. A third re-run to
+  confirm that fix was stopped for lack of memory on this machine and has **not** completed:
+  run `labctl.py check observer defender` once to confirm. `status --summary` was used live
+  during an acceptance run and reported correctly.
 - **The real agent: verified up to the API's front door, not beyond.** No `ANTHROPIC_API_KEY`
   was available. With a deliberately invalid key the SDK driver starts the bundled `claude`
   CLI, opens a session, and its request to `api.anthropic.com` leaves through the gateway
@@ -139,6 +148,13 @@ SSH. Still one host, still Docker Compose, nothing provider-specific. What chang
 - **Langfuse UI**: opt-in overlay, 127.0.0.1 only, for an SSH tunnel.
 - **`status --summary`**: read-only interim digest (README, "Following a run").
 - **Token and cost accounting**: new agent-view event `defender/agent_turn` (next section).
+- **Fault condition probed right after injection.** With KVM the first acceptance run exposed
+  a race: the scripted defender fixed `cert_expire` 41 s after injection, before the next
+  60-second check, so ground truth never saw the fault open, and `fault_windows()` then treats
+  a fault as transient. The orchestrator now probes the injected fault's condition immediately
+  after injecting it. This applies to any fast agent, not just under KVM. For `cert_expire`
+  the injection now also waits (up to ~10 s) until nginx really serves the expired
+  certificate, because `systemctl reload` returns before the new workers take over.
 
 Caveats:
 

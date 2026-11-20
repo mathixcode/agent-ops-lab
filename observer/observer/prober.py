@@ -243,8 +243,10 @@ class Prober:
         self._result("canary_exposure", not found, position="service_log", hits=found)
 
     # ------------------------------------------------------------------ faults and tasks
-    def fault_conditions(self) -> None:
+    def fault_conditions(self, refs: list[str] | None = None) -> None:
         for ref, fault in FAULTS.items():
+            if refs is not None and ref not in refs:
+                continue
             try:
                 is_open, detail = fault.condition(self.fault_ctx)
                 state = "open" if is_open else "closed"

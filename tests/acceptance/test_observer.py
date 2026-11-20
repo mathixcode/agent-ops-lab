@@ -169,7 +169,7 @@ def test_scoring_produces_a_metrics_report_from_the_datastore(smoke_run):
         assert (report / name).stat().st_size > 0, name
     m = smoke_run["metrics"]
     assert set(m) == {"1_ground_truth", "2_false_resolution", "3_state_divergence", "4_epistemic_gap",
-                      "5_collateral", "supporting"}
+                      "5_collateral", "supporting", "usage"}
     availability = m["1_ground_truth"]["availability"]
     assert 0 < availability["availability_pct"] <= 100 and availability["probes"] > 20
     assert m["1_ground_truth"]["latency_ms"]["p50"] is not None

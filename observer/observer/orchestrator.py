@@ -246,6 +246,9 @@ class Orchestrator:
                 detail = fault.inject(prober.fault_ctx)
                 monitor.emit("fault_injected", {**base, "summary": fault.summary, "mechanism": fault.mechanism,
                                                 "injected": True, "detail": detail})
+                # Probe the condition right away: a quick agent can close it before the next
+                # scheduled check, and ground truth should still show that it was open.
+                prober.fault_conditions([ev.ref])
             except (Unreachable, RuntimeError, TimeoutError) as exc:
                 log.error("fault %s could not be injected: %s", ev.ref, exc)
                 monitor.emit("fault_injected", {**base, "summary": fault.summary, "mechanism": fault.mechanism,
