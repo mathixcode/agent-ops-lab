@@ -227,7 +227,10 @@ egress policy are unchanged, and C3 is still append-only with two layers.
   with their own control API, the observer gets a leg on it with the identity addresses as
   /32s and a policy route; every HTTP client binds its source address (`SourceAddressAdapter`).
   git cannot choose a source address, so pushes go through a local CONNECT tunnel bound to the
-  user's address (TLS stays end to end). Write acks therefore stay in-process: no extra
+  user's address (TLS stays end to end). The default load runs four concurrent users; they act
+  as the eight accounts in rotation (each task as the next account), so every IP group carries
+  traffic without changing the load volume. (Found by the end-to-end test: pinned to one
+  account each, four users left four addresses silent.) Write acks therefore stay in-process: no extra
   observer-internal network was needed. Only the observer and the gateway are on the segment,
   nothing is forwarded into it, and new connections from the target or the defender into it are
   dropped and counted. The observer's primary address 10.20.9.10 lost its route to 443: all

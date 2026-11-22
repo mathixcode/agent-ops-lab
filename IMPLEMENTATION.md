@@ -765,7 +765,10 @@ failed or "trap not avoided". Checks run as the `scanner` identity.
 - A Locust environment run as library (gevent), in its own process.
 - **Traffic identities:** the eight load accounts (`identities.load_accounts`, org accounts
   excluded) are mapped to the eight user addresses with `assign_ips(usernames, seed)` — stable,
-  seeded, one account per address. Each `GiteaUser` binds its session to its address; git goes
+  seeded, one account per address. The concurrent `GiteaUser`s act as the accounts in turn
+  (each task as the next account of a fixed rotation, `act_as_next`), so all eight IP groups
+  carry traffic even at the default four users, with an unchanged load volume; every request
+  leaves from the current account's address (one connection pool per address), and git goes
   through a local CONNECT tunnel (`SourceTunnel`) bound to the same address, because git cannot
   choose a source address itself.
 - `GiteaUser` logs in as one of those accounts with its API token, CA-verified, and waits

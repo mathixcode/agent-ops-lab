@@ -7,8 +7,11 @@ pattern and the account -> address mapping, so a run is reproducible.
 Traffic identities: every simulated account is bound to one of the users-segment addresses
 (network.USER_IPS) by a stable, seeded mapping (identities.assign_ips). Its API requests leave
 from that address; so do its git pushes, which go through a small local CONNECT tunnel bound
-to the same address (git itself cannot choose a source address). Results are reported per IP
-group, with the failure signature of every failed request (signatures.py).
+to the same address (git itself cannot choose a source address). The concurrent Locust users
+act as the accounts in turn — each task as the next account in a fixed rotation — so every IP
+group carries traffic even when fewer users run than there are accounts, and the load volume
+does not change. Results are reported per IP group, with the failure signature of every
+failed request (signatures.py).
 
     python -m observer.loadgen.runner --seed 42 --profile steady_with_peaks --duration 21600
 """
@@ -47,6 +50,7 @@ WORKDIR = tempfile.mkdtemp(prefix="loadgen-")
 _next_user = iter(range(10**9))
 IP_OF: dict[str, str] = {}              # username -> source address (set in main from the seed)
 TUNNELS: dict[str, "SourceTunnel"] = {}
+ADAPTERS: dict[str, identities.SourceAddressAdapter] = {}    # one connection pool per address
 
 
 def say(kind: str, **fields) -> None:
@@ -157,14 +161,24 @@ class GiteaUser(HttpUser):
     wait_time = between(2, 7)
 
     def on_start(self) -> None:
-        self.who = USERS[next(_next_user) % len(USERS)]
-        self.ip = IP_OF[self.who["username"]]
-        identities.bind(self.client, self.ip)
+        self.index = next(_next_user)
+        self.turn = 0
         self.client.verify = CFG.ca_file
         self.client.trust_env = False
-        self.client.headers["Authorization"] = f"token {self.who['token']}"
-        self.rng = random.Random(f"{self.environment.parsed_seed}-{self.who['username']}")
+        self.rng = random.Random(f"{self.environment.parsed_seed}-worker-{self.index}")
         self.clones: dict[str, str] = {}
+        self.act_as_next()
+
+    def act_as_next(self) -> None:
+        """Become the next account in this user's rotation (and leave from its address)."""
+        self.who = USERS[(self.index + self.turn) % len(USERS)]
+        self.turn += 1
+        self.ip = IP_OF[self.who["username"]]
+        if self.ip not in ADAPTERS:
+            ADAPTERS[self.ip] = identities.SourceAddressAdapter(self.ip)
+        self.client.mount("https://", ADAPTERS[self.ip])
+        self.client.mount("http://", ADAPTERS[self.ip])
+        self.client.headers["Authorization"] = f"token {self.who['token']}"
 
     def context(self) -> dict:
         return {"ip": self.ip, "user": self.who["username"]}
@@ -175,6 +189,7 @@ class GiteaUser(HttpUser):
     # ---- browse -------------------------------------------------------------------------------
     @task(6)
     def browse(self) -> None:
+        self.act_as_next()
         repo = self.repo()
         pick = self.rng.choice(("repo", "tree", "commits", "issues"))
         path, name = {
@@ -188,6 +203,7 @@ class GiteaUser(HttpUser):
     # ---- post ---------------------------------------------------------------------------------
     @task(3)
     def post(self) -> None:
+        self.act_as_next()
         repo = self.repo()
         with self.client.get(f"/api/v1/repos/{repo}/issues?state=open&limit=10", name="browse issues",
                              timeout=30, catch_response=True) as listing:
@@ -213,6 +229,7 @@ class GiteaUser(HttpUser):
     # ---- push ---------------------------------------------------------------------------------
     @task(1)
     def push(self) -> None:
+        self.act_as_next()
         repo = self.repo()
         started = time.time()
         error, sha = None, None
@@ -222,7 +239,7 @@ class GiteaUser(HttpUser):
             detail = getattr(exc, "stderr", b"") or b""
             text = detail.decode("utf-8", "replace") if isinstance(detail, bytes) else str(detail)
             error = RuntimeError((text.strip().splitlines() or [type(exc).__name__])[-1][:300])
-            shutil.rmtree(self.clones.pop(repo, ""), ignore_errors=True)       # start from a fresh clone next time
+            shutil.rmtree(self.clones.pop(f"{self.who['username']}:{repo}", ""), ignore_errors=True)   # fresh clone next time
         self.environment.events.request.fire(
             request_type="GIT", name="git push", response_time=(time.time() - started) * 1000,
             response_length=0, exception=error, context=self.context())
@@ -236,13 +253,14 @@ class GiteaUser(HttpUser):
         return subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True, timeout=120).stdout.decode().strip()
 
     def _git_push(self, repo: str) -> str:
-        clone = self.clones.get(repo)
+        key = f"{self.who['username']}:{repo}"
+        clone = self.clones.get(key)
         if clone is None:
             clone = os.path.join(WORKDIR, f"{self.who['username']}-{repo.replace('/', '_')}")
             shutil.rmtree(clone, ignore_errors=True)
             url = f"https://{self.who['username']}:{self.who['token']}@{CFG.target_host}/{repo}.git"
             self._git(None, "clone", "-q", "--depth", "1", url, clone)
-            self.clones[repo] = clone
+            self.clones[key] = clone
         else:
             self._git(clone, "fetch", "-q", "--depth", "1", "origin", "main")
             self._git(clone, "reset", "-q", "--hard", "FETCH_HEAD")

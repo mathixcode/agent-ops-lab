@@ -32,9 +32,9 @@ map $remote_addr $acceptance_limited {{
     default "";
     {VICTIM} $binary_remote_addr;
 }}
-limit_req_zone $acceptance_limited zone=acceptance_one_user:1m rate=6r/m;
+limit_req_zone $acceptance_limited zone=acceptance_one_user:1m rate=2r/m;
 limit_req_status 429;
-limit_req zone=acceptance_one_user burst=2 nodelay;
+limit_req zone=acceptance_one_user burst=1 nodelay;
 """
 MANIFEST = """run_id: {run_id}
 seed: 5
