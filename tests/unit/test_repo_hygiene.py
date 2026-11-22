@@ -34,6 +34,8 @@ def test_scripts_embedded_for_the_guest_parse():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     ast.parse(mod.GUEST_SCRIPT)
+    ast.parse(mod.GUEST_CYCLE_SCRIPT)
+    ast.parse(mod.GUEST_API_SCRIPT)
     ast.parse(mod.RECENT_TEXT_SCRIPT)
     ast.parse(mod.INTEGRITY_SCRIPT)
 
@@ -71,6 +73,7 @@ def test_role_addresses_match_the_contract():
     assert ip("defender", "defender_seg") == network.ADDR["defender"]
     assert ip("langfuse-web", "defender_seg") == network.ADDR["langfuse"]
     assert ip("observer", "observer_seg") == network.ADDR["observer"]
+    assert ip("observer", "users_seg") == network.ADDR["users"]
     for role in network.SEGMENTS:
         assert ip("gateway", f"{role}_seg") == network.ADDR[f"gateway_{role}"]
 
@@ -78,6 +81,15 @@ def test_role_addresses_match_the_contract():
 def test_only_observer_and_gateway_touch_the_observer_segment():
     attached = {name for name, svc in COMPOSE["services"].items() if "observer_seg" in (svc.get("networks") or {})}
     assert attached == {"observer", "gateway"}
+
+
+def test_only_observer_and_gateway_touch_the_users_segment():
+    """The users segment holds the observer's client identities and nothing the target or the
+    defender could use: only the observer and the gateway are attached."""
+    attached = {name for name, svc in COMPOSE["services"].items() if "users_seg" in (svc.get("networks") or {})}
+    assert attached == {"observer", "gateway"}
+    entrypoint = (ROOT / "observer/entrypoint.sh").read_text(encoding="utf-8")
+    assert "lookup 103" in entrypoint and "IDENTITY_IPS" in entrypoint
 
 
 def test_only_the_gateway_has_an_internet_leg_at_runtime():

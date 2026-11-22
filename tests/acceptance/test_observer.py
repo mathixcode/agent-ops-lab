@@ -164,17 +164,18 @@ out({{"outcome": outcome, "unchanged": before == after, "rows": before}})''')
 # ---------------------------------------------------------------- scoring
 
 def test_scoring_produces_a_metrics_report_from_the_datastore(smoke_run):
-    report = smoke_run["dir"] / "report"
+    report = smoke_run["report"]
     for name in ("metrics.json", "report.md", "timeseries.csv"):
         assert (report / name).stat().st_size > 0, name
     m = smoke_run["metrics"]
-    assert set(m) == {"1_ground_truth", "2_false_resolution", "3_state_divergence", "4_epistemic_gap",
-                      "5_collateral", "supporting", "usage"}
+    assert set(m) == {"scorer_version", "run_validity", "1_ground_truth", "2_false_resolution", "3_state_divergence",
+                      "4_epistemic_gap", "5_collateral", "supporting", "org", "usage"}
     availability = m["1_ground_truth"]["availability"]
     assert 0 < availability["availability_pct"] <= 100 and availability["probes"] > 20
     assert m["1_ground_truth"]["latency_ms"]["p50"] is not None
     assert m["1_ground_truth"]["data_integrity"]["checked"] is True
-    assert m["2_false_resolution"]["incidents_injected"] == sum(1 for e in smoke_run["manifest"].event_schedule if e.type == "fault")
+    assert m["2_false_resolution"]["incidents_injected"] + len(m["run_validity"]["faults_not_applied"]) == \
+        sum(1 for e in smoke_run["manifest"].event_schedule if e.type == "fault")
     assert m["3_state_divergence"]["state_snapshots"] >= 3 and m["3_state_divergence"]["final"] is not None
     series = m["4_epistemic_gap"]["series"]
     assert len(series) == m["3_state_divergence"]["state_snapshots"]
@@ -182,8 +183,9 @@ def test_scoring_produces_a_metrics_report_from_the_datastore(smoke_run):
     rows = (report / "timeseries.csv").read_text(encoding="utf-8").strip().splitlines()
     assert len(rows) == len(series) + 1 and rows[0].startswith("ts,t_s,trigger,compaction")
     text = (report / "report.md").read_text(encoding="utf-8")
+    assert text.index("## Run validity") < text.index("## 1 Ground truth"), "run validity comes first"
     for heading in ("## 1 Ground truth", "## 2 False-resolution rate", "## 3 State divergence",
-                    "## 4 Epistemic gap", "## 5 Collateral"):
+                    "## 4 Epistemic gap", "## 5 Collateral", "## Org replies"):
         assert heading in text
 
 
@@ -281,8 +283,8 @@ def test_live_summary_reads_the_datastore_without_changing_it(smoke_run):
 
 
 def test_scoring_reports_token_usage_from_the_agent_view(smoke_run):
-    metrics = json.loads((Path(smoke_run["dir"]) / "report/metrics.json").read_text(encoding="utf-8"))["metrics"]
+    metrics = json.loads((smoke_run["report"] / "metrics.json").read_text(encoding="utf-8"))["metrics"]
     u = metrics["usage"]
     assert u["layer"] == "agent_view" and u["turns"] > 0
-    assert (Path(smoke_run["dir"]) / "report/usage_timeseries.csv").exists()
-    assert "Token usage" in (Path(smoke_run["dir"]) / "report/report.md").read_text(encoding="utf-8")
+    assert (smoke_run["report"] / "usage_timeseries.csv").exists()
+    assert "Token usage" in (smoke_run["report"] / "report.md").read_text(encoding="utf-8")

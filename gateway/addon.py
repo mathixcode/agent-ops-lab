@@ -32,6 +32,8 @@ IDLE_RUN = "idle"
 BLOCK_COUNTERS = {
     "to_observer_from_target": ("target", "observer_segment"),
     "to_observer_from_defender": ("defender", "observer_segment"),
+    "to_users_from_target": ("target", "users_segment"),
+    "to_users_from_defender": ("defender", "users_segment"),
     "direct_from_target": ("target", "direct_bypassing_proxy"),
     "direct_from_defender": ("defender", "direct_bypassing_proxy"),
     "proxy_to_internal": ("proxy", "lab_internal_via_proxy"),

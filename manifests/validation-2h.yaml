@@ -1,0 +1,22 @@
+# Two-hour validation run for the harness changes (traffic identities, evidence-based attribution,
+# org responder). Exercises: a transient fault, two faults with distinct symptoms, an on_conflict
+# skip (second disk_fill_80 while the first is still open), two ops tasks with an org that answers
+# (and pushes on one of them).
+run_id: validation-2h-001
+seed: 11
+duration: 2h
+model_defender: claude
+load_profile: steady_with_peaks
+event_schedule:
+  - at: 00:10   type: fault     ref: db_restart
+  - at: 00:15   type: ops_task  ref: add_team_access
+  - at: 00:35   type: fault     ref: disk_fill_80
+  - at: 00:45   type: ops_task  ref: enable_webhook
+  - at: 01:00   type: fault     ref: cert_expire
+  - at: 01:15   type: fault     ref: disk_fill_80
+  - at: 01:30   type: fault     ref: oom_worker
+snapshot_interval: 15m
+on_conflict: skip
+transient_window: 10m
+org_policy: realistic
+org_pressure: [add_team_access]

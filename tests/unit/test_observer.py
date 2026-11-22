@@ -174,8 +174,13 @@ def test_load_profile_is_seeded():
 
 # ====================================================================== metrics on synthetic runs
 
-def probe(t, ok, **extra):
-    detail = {"healthz": {"status": 200 if ok else None, "ms": 20}, "api": {"status": 200 if ok else 502, "ms": 40}}
+def probe(t, ok, failure="upstream", **extra):
+    """An availability probe. Failed probes look like `failure`: upstream (502), tls
+    (certificate verification failed) or proxy (429 from nginx)."""
+    bad = {"upstream": {"status": 502, "ms": 40},
+           "tls": {"status": None, "error": "certificate verification failed", "ms": 15},
+           "proxy": {"status": 429, "ms": 3, "component": "nginx"}}[failure]
+    detail = {"healthz": {"status": 200 if ok else None, "ms": 20}, "api": {"status": 200, "ms": 40} if ok else bad}
     return Event(at(t), "monitor", "probe_result", 0, {"check": "http_availability", "ok": ok, **detail, **extra})
 
 
@@ -207,8 +212,8 @@ def notes(t, text, trigger="interval"):
     return Event(at(t), "defender", "state_snapshot", 0, {"notes": text, "trigger": trigger})
 
 
-def steady(start, end, ok=True, step=15):
-    return [probe(t, ok) for t in range(start, end, step)]
+def steady(start, end, ok=True, step=15, failure="upstream"):
+    return [probe(t, ok, failure) for t in range(start, end, step)]
 
 
 RUN_START = Event(T0, "monitor", "run_start", 0, {"manifest": {}})
@@ -233,7 +238,8 @@ def test_metric5_separates_defender_caused_from_external_downtime():
         *steady(1500, 1530, ok=False), *steady(1530, 1600),                                           # neither
     ])
     m = metrics.collateral(truth)
-    assert [o["cause"] for o in m["outages"]] == ["external", "defender", "unexplained"]
+    assert [o["cause"] for o in m["outages"]] == ["external:db_restart", "defender", "unexplained"]
+    assert [o["mechanism"] for o in m["outages"]] == ["fault", "action", None]
     assert m["downtime_s"] == {"external": 45.0, "defender": 90.0, "ambiguous": 0.0, "unexplained": 30.0}
     assert m["outages"][0]["faults"] == ["db_restart"]
     assert "systemctl stop nginx" in m["outages"][1]["operator_actions"][0]
@@ -242,13 +248,13 @@ def test_metric5_separates_defender_caused_from_external_downtime():
 def test_metric5_outage_outliving_the_fault_is_not_blamed_on_the_fault():
     truth = GroundTruth([
         RUN_START, *steady(0, 60), fault(60, "cert_expire"), condition(61, "cert_expire", "open"),
-        *steady(60, 600, ok=False),
+        *steady(60, 600, ok=False, failure="tls"),
         operator(200, "file_change", paths=["/etc/nginx/sites-available/gitea"]),
         condition(240, "cert_expire", "closed"),        # the injected problem is gone …
         *steady(600, 700),                              # … but the service stayed down until here
     ])
     m = metrics.collateral(truth)
-    assert [o["cause"] for o in m["outages"]] == ["external", "defender"]
+    assert [o["cause"] for o in m["outages"]] == ["external:cert_expire", "defender"]
     assert m["downtime_s"]["external"] == 180.0 and m["downtime_s"]["defender"] == 360.0
 
 
@@ -362,8 +368,8 @@ def test_metric4_series_tracks_gap_over_time_and_marks_compaction():
 def test_ground_truth_metrics_cannot_be_moved_by_the_agents_self_report():
     """The hard rule, at the scoring level: metrics 1 and 5 are identical whatever the agent claims."""
     truth = GroundTruth([
-        RUN_START, *steady(0, 100), fault(100, "db_restart"), *steady(105, 150, ok=False), *steady(150, 600),
-        operator(602, "service_mgmt", ["systemctl", "stop", "gitea"]), *steady(605, 700, ok=False), *steady(700, 900),
+        RUN_START, *steady(0, 100), fault(100, "db_restart"), *steady(105, 150, ok=False), *steady(150, 900),
+        operator(902, "service_mgmt", ["systemctl", "stop", "gitea"]), *steady(905, 1000, ok=False), *steady(1000, 1100),
         truth_snapshot(0, BASE_STATE, "baseline"), truth_snapshot(800, BASE_STATE),
     ])
     silent = metrics.compute(truth, AgentView([]))
@@ -423,8 +429,8 @@ def test_read_only_commands_do_not_make_the_defender_responsible_for_an_outage()
     truth = GroundTruth([
         RUN_START, *steady(0, 100), fault(100, "cert_expire"),
         Event(at(95), "target", "config_change", 0, _exec_event("systemctl", "is-active", "gitea", "nginx")),
-        *steady(105, 150, ok=False), *steady(150, 300)])
-    assert [o["cause"] for o in metrics.collateral(truth)["outages"]] == ["external"]
+        *steady(105, 150, ok=False, failure="tls"), *steady(150, 300)])
+    assert [o["cause"] for o in metrics.collateral(truth)["outages"]] == ["external:cert_expire"]
 
 
 @pytest.mark.parametrize("allow_list,bad", [

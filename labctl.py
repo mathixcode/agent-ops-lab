@@ -371,6 +371,47 @@ else:
 """
 
 
+# Runs inside the observer: can every traffic identity reach the target's web front end
+# (through the gateway, from its own source address)?
+IDENTITY_PROBE = r"""import json, socket
+from labcontracts import network
+out = {}
+for name, addr in [("user", a) for a in network.USER_IPS] + list(network.IDENTITY_IPS.items()):
+    try:
+        socket.create_connection((network.ADDR["target"], 443), timeout=5, source_address=(addr, 0)).close()
+        out[addr] = [name, "ok"]
+    except OSError as exc:
+        out[addr] = [name, type(exc).__name__]
+print(json.dumps(out))
+"""
+
+
+def users_segment_verdict(compose_doc: dict) -> tuple[str, str, str]:
+    """Static check: compose defines the users segment as the contract says, and only the
+    observer and the gateway are attached to it."""
+    seg = network.SEGMENTS["users"]
+    net = (compose_doc.get("networks") or {}).get("users_seg") or {}
+    subnet = ((net.get("ipam") or {}).get("config") or [{}])[0].get("subnet")
+    attached = sorted(n for n, svc in (compose_doc.get("services") or {}).items()
+                      if "users_seg" in (svc.get("networks") or {}))
+    if net.get("driver") != "macvlan" or not net.get("internal") or subnet != seg:
+        return "FAIL", "users segment", f"compose.yaml users_seg must be an internal macvlan network {seg} (found {subnet})"
+    if attached != ["gateway", "observer"]:
+        return "FAIL", "users segment", f"only gateway and observer may join users_seg (found {attached})"
+    return "ok", "users segment", (f"{seg}: {len(network.USER_IPS)} user addresses, "
+                                   + ", ".join(f"{k} {v}" for k, v in network.IDENTITY_IPS.items()))
+
+
+def identities_verdict(result: dict[str, list[str]]) -> tuple[str, str, str]:
+    bad = {ip: v for ip, v in result.items() if v[1] != "ok"}
+    if not result:
+        return "WARN", "identities", "could not be checked"
+    if bad:
+        return "FAIL", "identities", "no route to the web front end from " + ", ".join(
+            f"{ip} ({v[0]}: {v[1]})" for ip, v in sorted(bad.items()))
+    return "ok", "identities", f"all {len(result)} identity addresses reach the target on 443 through the gateway"
+
+
 def parse_kv(text: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
 
@@ -512,6 +553,21 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
     for row in assess_resources(int(d.get("NCPU") or 0), int(d.get("MemTotal") or 0), disk_free):
         add(*row)
 
+    import yaml
+    add(*users_segment_verdict(yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))))
+    if (LAB / "lab.env").exists():
+        ps = subprocess.run(compose_cmd("ps", "--status", "running", "--services"), cwd=ROOT,
+                            capture_output=True, text=True, env=env)
+        if "observer" in ps.stdout.split():
+            res = subprocess.run(compose_cmd("exec", "-T", "observer", "python", "-"), input=IDENTITY_PROBE,
+                                 cwd=ROOT, capture_output=True, text=True, env=env)
+            try:
+                add(*identities_verdict(json.loads(res.stdout.strip().splitlines()[-1])))
+            except (ValueError, IndexError):
+                add("WARN", "identities", f"check failed: {(res.stderr or res.stdout).strip()[-200:]}")
+        else:
+            add("ok", "identities", "lab not running; checked when the observer is up")
+
     cfg = settings()
     disabled = kvm_disabled()
     active = None
@@ -606,12 +662,44 @@ def cmd_status(args: argparse.Namespace) -> None:
         compose("exec", "-T", "observer", "lab-observer", "status", check=False)
 
 
+def scorer_version() -> str:
+    sys.path[:0] = [str(ROOT / "observer")]
+    from observer.scoring.metrics import SCORER_VERSION
+    return SCORER_VERSION
+
+
 def cmd_score(args: argparse.Namespace) -> None:
+    """Score a run. Nothing that already exists under runs/ is ever modified.
+
+    - An exported run (runs/<run_id>/events/*.jsonl) is re-scored on this host, read-only; the
+      report goes to scores/<run_id>/report-scorer-<version>/ (the original report stays as it is).
+    - Otherwise the observer scores it from its datastore (read-only) into
+      /data/runs/<run_id>/report-scorer-<version>/, and the run is exported to runs/<run_id>/
+      (only if that directory does not exist yet; if it does, the report goes to scores/)."""
+    version = scorer_version()
+    name = f"report-scorer-{version}"
+    exported = ROOT / "runs" / args.run_id / "events" / "ground_truth.jsonl"
+    if exported.exists() and not args.from_c3:
+        sys.path[:0] = [str(ROOT / "observer")]
+        from observer.scoring.report import score_export
+        out = ROOT / "scores" / args.run_id / name
+        result = score_export(ROOT / "runs" / args.run_id, out)
+        co = result["5_collateral"]
+        print(json.dumps({"report": str(out), "scorer_version": version, "source": str(exported.parent.parent),
+                          "defender_share_pct": co["defender_share_pct"], "downtime_s": co["downtime_s"],
+                          "attribution_confidence": co["confidence"]["level"]}, indent=2))
+        return
     compose("exec", "-T", "observer", "lab-observer", "score", args.run_id)
     dest = ROOT / "runs" / args.run_id
-    dest.mkdir(parents=True, exist_ok=True)
-    compose("cp", f"observer:/data/runs/{args.run_id}/.", f"runs/{args.run_id}")
-    print(f"report copied to {dest}")
+    if not dest.exists():
+        dest.mkdir(parents=True)
+        compose("cp", f"observer:/data/runs/{args.run_id}/.", f"runs/{args.run_id}")
+        print(f"run exported and scored: {dest} (report in {dest / name})")
+    else:
+        out = ROOT / "scores" / args.run_id
+        out.mkdir(parents=True, exist_ok=True)
+        compose("cp", f"observer:/data/runs/{args.run_id}/{name}", f"scores/{args.run_id}/{name}")
+        print(f"runs/{args.run_id} left untouched; report copied to {out / name}")
 
 
 def cmd_reset_target(_args: argparse.Namespace) -> None:
@@ -656,8 +744,10 @@ def main() -> None:
                    help="interim digest of the run so far, read-only from the datastore")
     p.add_argument("--json", action="store_true", help="with --summary: machine-readable output")
     p.add_argument("run_id", nargs="?", help="with --summary: a specific run (default: current/last)")
-    p = add("score", cmd_score, "compute the metrics report for a run and copy it to runs/")
+    p = add("score", cmd_score, "score a run (exported runs are re-scored read-only into scores/)")
     p.add_argument("run_id")
+    p.add_argument("--from-c3", action="store_true",
+                   help="score from the observer's datastore even if an export exists in runs/")
     add("reset-target", cmd_reset_target, "reset the target VM from the golden snapshot")
     p = add("check", cmd_check, "run acceptance checks (all, or: target gateway observer defender)")
     p.add_argument("components", nargs="*", metavar="component")

@@ -1,7 +1,21 @@
 """Spec 1.1 — roles, segments and the firewall policy.
 
 The gateway renders its nftables ruleset from FORWARD_ALLOW; tests assert that nothing in
-here (or in compose.yaml) opens a path *into* the observer segment.
+here (or in compose.yaml) opens a path *into* the observer segment or the users segment.
+
+Traffic identities. Everything the harness sends to the target's web front end comes from
+the users segment, each kind from its own source address, so a client-scoped rule the
+defender writes (a rate limit, a block) hits exactly one identity and is attributable:
+
+    10.20.3.11-18   simulated users (the load generator; one seeded account per address)
+    10.20.3.30      probe    the user-perceived availability probe
+    10.20.3.31      scanner  security, canary and task checks
+    10.20.3.32      org      ticket delivery and the org responder (colleagues)
+
+They are addresses of the observer's own leg on the users segment (the observer binds each
+request to its identity's source address); the segment holds nothing but the observer and
+the gateway. The observer's primary address 10.20.9.10 keeps only the read-only SSH account
+and the control channels.
 """
 from __future__ import annotations
 
@@ -11,6 +25,7 @@ from dataclasses import dataclass
 SEGMENTS = {
     "target": "10.20.1.0/24",
     "defender": "10.20.2.0/24",
+    "users": "10.20.3.0/24",
     "observer": "10.20.9.0/24",
 }
 
@@ -23,13 +38,27 @@ ADDR = {
     "gateway_defender": "10.20.2.2",
     "defender": "10.20.2.10",
     "langfuse": "10.20.2.20",       # trace sink for the defender's self-report
+    # users segment (client identities of the observer, see the module docstring)
+    "gateway_users": "10.20.3.2",
+    "users": "10.20.3.10",          # the observer's own leg on the users segment
     # observer segment
     "gateway_observer": "10.20.9.2",
     "observer": "10.20.9.10",
 }
 
+# Source addresses of the simulated users: one per IP group, at least eight.
+USER_IPS: tuple[str, ...] = tuple(f"10.20.3.{i}" for i in range(11, 19))
+
+# Dedicated harness identities, never shared with load (spec C1/C2, "traffic identities").
+IDENTITY_IPS: dict[str, str] = {
+    "probe": "10.20.3.30",
+    "scanner": "10.20.3.31",
+    "org": "10.20.3.32",
+}
+
 PORTS = {
     "ssh": 22,
+    "http": 80,
     "https": 443,
     "ntp": 123,
     "proxy": 3128,              # egress proxy on the gateway
@@ -56,8 +85,10 @@ class Allow:
 FORWARD_ALLOW: tuple[Allow, ...] = (
     Allow(SEGMENTS["defender"], ADDR["target"], "tcp", (22, 443),
           "B -> A: operator SSH and HTTPS / Gitea API"),
-    Allow(ADDR["observer"], ADDR["target"], "tcp", (22, 443),
-          "C -> A: read-only observer SSH, probes and load traffic"),
+    Allow(SEGMENTS["users"], ADDR["target"], "tcp", (80, 443),
+          "users segment -> A: simulated users, probe, scanner, org (web front end only)"),
+    Allow(ADDR["observer"], ADDR["target"], "tcp", (22,),
+          "C -> A: read-only observer SSH (state and log collection)"),
     Allow(ADDR["observer"], ADDR["hypervisor"], "tcp", (PORTS["hypervisor_control"],),
           "C -> hypervisor: snapshot reset and fault injection"),
     # The next two are additions to the spec's table (see BUILD_PLAN.md decision 3).
@@ -92,3 +123,19 @@ def overlaps(a: str, b: str) -> bool:
 def rules_into_observer() -> list[Allow]:
     """Must always be empty — the one rule validity hinges on."""
     return [r for r in FORWARD_ALLOW if overlaps(r.dst, SEGMENTS["observer"])]
+
+
+def rules_into_users() -> list[Allow]:
+    """Must always be empty: nothing may open a connection into the users segment either."""
+    return [r for r in FORWARD_ALLOW if overlaps(r.dst, SEGMENTS["users"])]
+
+
+def identity_of(ip: str) -> str:
+    """Traffic identity of a source address seen at the target ("user", "probe", "scanner",
+    "org", "observer", "defender", …), or "other"."""
+    if ip in USER_IPS:
+        return "user"
+    for name, addr in IDENTITY_IPS.items():
+        if ip == addr:
+            return name
+    return segment_of(ip) or "other"

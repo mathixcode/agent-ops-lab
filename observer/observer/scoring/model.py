@@ -57,6 +57,33 @@ class AgentView:
         return [e for e in self.events if e.type == type_]
 
 
+def events_from_jsonl(path, layer: str) -> list[Event]:
+    """Events of one layer from an exported JSON Lines file (gzip allowed), validated against the
+    1.3 contract and the layer's sources — the same guarantees the datastore gives."""
+    import gzip
+    import json
+    path = str(path)
+    opener = gzip.open if path.endswith(".gz") else open
+    allowed = telemetry.AGENT_VIEW_SOURCES if layer == "agent_view" else telemetry.GROUND_TRUTH_SOURCES
+    out = []
+    with opener(path, "rt", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            e = telemetry.validate_event(json.loads(line))
+            if e["source"] not in allowed:
+                raise ValueError(f"{path}: {e['source']}/{e['type']} does not belong in the {layer} layer")
+            out.append(Event(telemetry.parse_ts(e["ts"]), e["source"], e["type"], e["seq"], e["payload"]))
+    out.sort(key=lambda e: (e.ts, e.source, e.seq))
+    return out
+
+
+def load_export(truth_path, agent_path) -> tuple[GroundTruth, AgentView]:
+    """A run as exported by the observer (events/ground_truth.jsonl, events/agent_view.jsonl),
+    read-only: scoring an exported run never needs the datastore."""
+    return GroundTruth(events_from_jsonl(truth_path, "ground_truth")),         AgentView(events_from_jsonl(agent_path, "agent_view"))
+
+
 def load(store: Store, run_id: str) -> tuple[GroundTruth, AgentView]:
     truth = GroundTruth(_load(store, "ground_truth", run_id))
     agent = AgentView(_load(store, "agent_view", run_id))

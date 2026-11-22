@@ -26,15 +26,14 @@ import re, requests
 status = hv.status()
 kernel = guest("uname -r; systemd-detect-virt; systemctl is-system-running; ps -o comm= -p 1")
 user = cfg.user("loadgen")
-s = requests.Session(); s.trust_env = False; s.verify = cfg.ca_file
+s = web()
 front = s.get(cfg.target_url + "/")
 login = s.post(cfg.target_url + "/user/login", data={"user_name": user["username"], "password": user["password"]},
                allow_redirects=False)
 home = s.get(cfg.target_url + "/")
-bad = requests.post(cfg.target_url + "/user/login", data={"user_name": user["username"], "password": "wrong"},
-                    allow_redirects=False, verify=cfg.ca_file)
-api = requests.get(cfg.target_url + "/api/v1/version", headers={"Authorization": "token " + user["token"]},
-                   verify=cfg.ca_file)
+bad = web().post(cfg.target_url + "/user/login", data={"user_name": user["username"], "password": "wrong"},
+                 allow_redirects=False)
+api = web().get(cfg.target_url + "/api/v1/version", headers={"Authorization": "token " + user["token"]})
 out({"vm": status["vm"], "guest_agent": status["guest_agent"], "kernel": kernel[1].split(),
      "front_status": front.status_code, "front_is_login": "/user/login" in front.url,
      "login_status": login.status_code, "logged_in": user["username"] in home.text,
@@ -215,7 +214,7 @@ def capture():
 
 def reset():
     target.close(); hv.reset(); hv.wait_guest(900)
-    s = requests.Session(); s.trust_env = False; s.verify = cfg.ca_file
+    s = web("probe")
     for _ in range(180):
         try:
             if s.get(cfg.target_url + "/api/healthz", timeout=10).status_code == 200: return

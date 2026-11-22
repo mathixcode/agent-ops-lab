@@ -2,6 +2,9 @@
 *to* the observer. Each collector pulls on the observer's cadence.
 
     TargetCollector    -> ground truth   target/config_change (auditd), service_log, health
+                                         (incl. the nginx boundary record: every access line with
+                                         status >= 400 and every error.log line about limit_req,
+                                         limit_conn, access rules or upstreams, per client)
     GatewayCollector   -> ground truth   gateway/egress_request, canary_egress
     LangfuseCollector  -> agent view     defender/* (the agent's self-report, via Langfuse)
 
@@ -45,7 +48,9 @@ tail_new() {  # file saved_inode saved_lines [filter]
 echo "@@AUDIT"
 tail_new /var/log/audit/audit.log "%(audit_inode)s" %(audit_lines)d
 echo "@@NGINX"
-tail_new /var/log/nginx/access.log "%(nginx_inode)s" %(nginx_lines)d | grep -E '^@@CURSOR|^%(defender_prefix)s' | grep -vE '"(GET|HEAD|OPTIONS) '
+tail_new /var/log/nginx/access.log "%(nginx_inode)s" %(nginx_lines)d | head -n 200000
+echo "@@NGINXERR"
+tail_new /var/log/nginx/error.log "%(err_inode)s" %(err_lines)d | grep -E '^@@CURSOR|limiting (requests|connections)|access forbidden by rule|upstream|connect\(\) failed' | head -n 200000
 echo "@@JOURNAL"
 journalctl -o json --no-pager -n 4000 %(journal_from)s %(journal_units)s 2>/dev/null
 echo "@@HEALTH"
@@ -58,6 +63,78 @@ echo "@@END"
 '''
 
 _NGINX = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+)[^"]*" (\d{3}) ')
+_NGINX_ERR = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[(\w+)\] [^:]*: (?:\*\d+ )?(.*)$")
+_CLIENT = re.compile(r"client: ([0-9a-fA-F.:]+)")
+MAX_SAMPLES = 3
+
+
+def nginx_error_kind(message: str) -> str:
+    """What an nginx error.log line says happened to a client's request."""
+    if "limiting requests" in message:
+        return "limit_req"
+    if "limiting connections" in message:
+        return "limit_conn"
+    if "access forbidden by rule" in message:
+        return "access_rule"
+    return "upstream"
+
+
+def aggregate_access(lines, run_start, defender_prefix):
+    """nginx access lines -> (individual events, error aggregates, routine counts).
+
+    individual: state-changing API calls from the defender segment (authorship evidence)
+    errors:     {(minute, status, client): {count, first, methods, sample_paths}}  — every line >= 400
+    routine:    {minute: {client: {"2xx": n, "3xx": n}}}"""
+    individual, errors, routine = [], {}, {}
+    for line in lines:
+        m = _NGINX.match(line)
+        if not m:
+            continue
+        remote, when, method, path, status = m.groups()
+        try:
+            ts = dt.datetime.strptime(when, "%d/%b/%Y:%H:%M:%S %z").astimezone(dt.timezone.utc)
+        except ValueError:
+            continue
+        if ts < run_start:
+            continue
+        code = int(status)
+        if remote.startswith(defender_prefix) and method not in ("GET", "HEAD", "OPTIONS"):
+            individual.append((ts, line, remote, method, path, code))
+        minute = ts.replace(second=0, microsecond=0)
+        if code >= 400:
+            agg = errors.setdefault((minute, code, remote), {"count": 0, "first": ts, "methods": {}, "sample_paths": []})
+            agg["count"] += 1
+            agg["methods"][method] = agg["methods"].get(method, 0) + 1
+            short = path.split("?", 1)[0][:200]
+            if short not in agg["sample_paths"] and len(agg["sample_paths"]) < MAX_SAMPLES:
+                agg["sample_paths"].append(short)
+        else:
+            cls = f"{code // 100}xx"
+            per = routine.setdefault(minute, {}).setdefault(remote, {})
+            per[cls] = per.get(cls, 0) + 1
+    return individual, errors, routine
+
+
+def aggregate_errors(lines, run_start):
+    """nginx error.log lines -> {(minute, kind, client): {count, first, level, sample}}"""
+    out = {}
+    for line in lines:
+        m = _NGINX_ERR.match(line)
+        if not m:
+            continue
+        when, level, message = m.groups()
+        try:
+            ts = dt.datetime.strptime(when, "%Y/%m/%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
+        except ValueError:
+            continue
+        if ts < run_start:
+            continue
+        client = (_CLIENT.search(message) or [None, "?"])[1]
+        kind = nginx_error_kind(message)
+        agg = out.setdefault((ts.replace(second=0, microsecond=0), kind, client),
+                             {"count": 0, "first": ts, "level": level, "sample": message[:300]})
+        agg["count"] += 1
+    return out
 
 
 class TargetCollector:
@@ -72,7 +149,8 @@ class TargetCollector:
         self.journal_hits = journal_hits
         uids = cfg.golden().get("uids", {})
         self.uid_names = {int(uid): name for name, uid in uids.items()}
-        self.cursor = {"audit_inode": "", "audit_lines": 0, "nginx_inode": "", "nginx_lines": 0, "journal": ""}
+        self.cursor = {"audit_inode": "", "audit_lines": 0, "nginx_inode": "", "nginx_lines": 0,
+                       "err_inode": "", "err_lines": 0, "journal": ""}
         self.unreachable_since: dt.datetime | None = None
 
     def pull(self) -> dict[str, int]:
@@ -81,14 +159,14 @@ class TargetCollector:
         script = TARGET_SCRIPT % {
             "audit_inode": self.cursor["audit_inode"], "audit_lines": self.cursor["audit_lines"],
             "nginx_inode": self.cursor["nginx_inode"], "nginx_lines": self.cursor["nginx_lines"],
-            "defender_prefix": re.escape(network.SEGMENTS["defender"].rsplit(".", 1)[0] + "."),
+            "err_inode": self.cursor["err_inode"], "err_lines": self.cursor["err_lines"],
             "journal_from": journal_from, "journal_units": " ".join(f"-u {u}" for u in JOURNAL_UNITS),
             "health_units": " ".join(HEALTH_UNITS)}
         _, out, _ = self.ssh.run("bash -s", stdin=script, timeout=120)
         sections: dict[str, list[str]] = {}
         current = None
         for line in out.split("\n"):       # not splitlines(): it also splits on the \x1d inside audit records
-            if line in ("@@AUDIT", "@@NGINX", "@@JOURNAL", "@@HEALTH", "@@END"):
+            if line in ("@@AUDIT", "@@NGINX", "@@NGINXERR", "@@JOURNAL", "@@HEALTH", "@@END"):
                 current = line[2:]
                 sections[current] = []
             elif current:
@@ -96,7 +174,8 @@ class TargetCollector:
         if "END" not in sections:
             raise Unreachable("target collection script did not complete")
         counts = {"config_change": self._audit(sections["AUDIT"]),
-                  "service_log": self._nginx(sections["NGINX"]) + self._journal(sections["JOURNAL"]),
+                  "service_log": self._nginx(sections["NGINX"]) + self._nginx_errors(sections.get("NGINXERR", []))
+                  + self._journal(sections["JOURNAL"]),
                   "health": self._health(sections["HEALTH"])}
         return counts
 
@@ -117,25 +196,49 @@ class TargetCollector:
         return n
 
     def _nginx(self, lines: list[str]) -> int:
-        """State-changing API calls that arrived from the defender segment: the independent
-        record of what the agent did through the Gitea API (auditd cannot see those)."""
-        n = 0
-        for line in self._take_cursor(lines, "nginx"):
-            m = _NGINX.match(line)
-            if not m:
-                continue
-            remote, when, method, path, status = m.groups()
-            try:
-                ts = dt.datetime.strptime(when, "%d/%b/%Y:%H:%M:%S %z").astimezone(dt.timezone.utc)
-            except ValueError:
-                continue
-            if ts < self.run_start:
-                continue
+        """The nginx access log as boundary record:
+        - state-changing API calls from the defender segment, one event each (what the agent did
+          through the Gitea API — auditd cannot see those);
+        - every request answered with status >= 400, aggregated per minute x status x client
+          (who was rejected, by what status — the evidence for attribution);
+        - routine 2xx/3xx traffic as per-minute counts per client."""
+        lines = self._take_cursor(lines, "nginx")
+        for line in lines:
             self._note_canaries(line, "nginx-access")
+        prefix = network.SEGMENTS["defender"].rsplit(".", 1)[0] + "."
+        individual, errors, routine = aggregate_access(lines, self.run_start, prefix)
+        n = 0
+        for ts, line, remote, method, path, status in individual:
             self.out.emit("service_log", {"unit": "nginx-access", "message": self.scanner.redact(line)[:600],
                                           "remote_addr": remote, "method": method,
                                           "path": self.scanner.redact(path.split("?", 1)[0])[:300],
-                                          "status": int(status)}, ts=ts)
+                                          "status": status}, ts=ts)
+            n += 1
+        for (minute, status, client), agg in sorted(errors.items(), key=lambda kv: kv[1]["first"]):
+            self.out.emit("service_log", {
+                "unit": "nginx-access-errors", "client_ip": client, "identity": network.identity_of(client),
+                "status": status, "count": agg["count"], "minute": telemetry.format_ts(minute),
+                "methods": agg["methods"], "sample_paths": [self.scanner.redact(p) for p in agg["sample_paths"]],
+                "message": f"{agg['count']} request(s) from {client} answered HTTP {status}"}, ts=agg["first"])
+            n += 1
+        for minute, per_client in sorted(routine.items()):
+            self.out.emit("service_log", {"unit": "nginx-access-summary", "minute": telemetry.format_ts(minute),
+                                          "by_client": per_client,
+                                          "message": f"routine requests in {minute:%H:%M} by client"}, ts=minute)
+            n += 1
+        return n
+
+    def _nginx_errors(self, lines: list[str]) -> int:
+        """nginx error.log lines about rejected or failed requests (limit_req, limit_conn, access
+        rules, upstreams), aggregated per minute x kind x client — the corroboration that a
+        rejection was nginx's doing, and for which client."""
+        n = 0
+        aggregated = aggregate_errors(self._take_cursor(lines, "err"), self.run_start)
+        for (minute, kind, client), agg in sorted(aggregated.items(), key=lambda kv: kv[1]["first"]):
+            self.out.emit("service_log", {
+                "unit": "nginx-error", "kind": kind, "client_ip": client, "identity": network.identity_of(client),
+                "count": agg["count"], "level": agg["level"], "minute": telemetry.format_ts(minute),
+                "message": self.scanner.redact(agg["sample"])}, ts=agg["first"])
             n += 1
         return n
 

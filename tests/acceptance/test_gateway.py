@@ -10,7 +10,7 @@ import pytest
 from conftest import (GATEWAY_CALL, docker, gateway_offset, network, observer_py, probe, registry,
                       running, wait_for_gateway_events, PROBE_IMAGE, PROJECT)
 
-SPARE = {"target": "10.20.1.50", "defender": "10.20.2.50", "observer": "10.20.9.61"}
+SPARE = {"target": "10.20.1.50", "defender": "10.20.2.50", "users": "10.20.3.60", "observer": "10.20.9.61"}
 RUN_ID = "accept-gateway"
 
 
@@ -157,6 +157,52 @@ out({{"listener": tcp_open("{ip}", 9999), "gateway_observer_leg": tcp_open("{net
 
     events = wait_for_gateway_events(start, both_counted, timeout=40)
     assert both_counted(events), "attempts to reach the observer segment must be recorded"
+
+
+@pytest.fixture()
+def users_side_listener():
+    """Something listening on the users segment (where the observer's client identities live)."""
+    name, ip = "agentopslab-accept-users-listener", "10.20.3.61"
+    docker("rm", "-f", name)
+    code = (f"import subprocess, http.server; subprocess.run(['ip','route','replace','default','via',"
+            f"'{network.ADDR['gateway_users']}']); "
+            "http.server.HTTPServer(('0.0.0.0', 9999), http.server.SimpleHTTPRequestHandler).serve_forever()")
+    started = docker("run", "-d", "--rm", "--name", name, "--network", f"{PROJECT}_users_seg", "--ip", ip,
+                     "--cap-add", "NET_ADMIN", "--entrypoint", "python", PROBE_IMAGE, "-c", code)
+    assert started.returncode == 0, started.stderr
+    yield ip
+    docker("rm", "-f", name)
+
+
+def test_target_and_defender_cannot_open_connections_into_the_users_segment(users_side_listener):
+    ip = users_side_listener
+    check = f'''
+time.sleep(1)
+out({{"listener": tcp_open("{ip}", 9999), "observer_users_leg": tcp_open("{network.ADDR['users']}", 22),
+      "probe_identity": tcp_open("{network.IDENTITY_IPS['probe']}", 9999)}})'''
+    assert probe("users", f'time.sleep(1); out(tcp_open("{ip}", 9999))', SPARE["users"]) is True   # control
+    start = gateway_offset()
+    for segment in ("target", "defender"):
+        assert probe(segment, check, SPARE[segment]) == {
+            "listener": False, "observer_users_leg": False, "probe_identity": False}, segment
+
+    def counted(events):
+        roles = {e["payload"]["src_role"] for e in events
+                 if e["type"] == "egress_request" and e["payload"]["destination"] == "users_segment"}
+        return {"target", "defender"} <= roles
+
+    assert counted(wait_for_gateway_events(start, counted, timeout=40)),         "attempts to reach the users segment must be recorded"
+
+
+def test_users_segment_reaches_only_the_web_front_end():
+    res = probe("users", f'''
+out({{"https": tcp_open("{network.ADDR['target']}", 443), "http": tcp_open("{network.ADDR['target']}", 80),
+      "ssh": tcp_open("{network.ADDR['target']}", 22, timeout=3),
+      "hypervisor": tcp_open("{network.ADDR['hypervisor']}", 8080, timeout=3),
+      "defender": tcp_open("{network.ADDR['defender']}", 8090, timeout=3),
+      "langfuse": tcp_open("{network.ADDR['langfuse']}", 3000, timeout=3)}})''', SPARE["users"])
+    assert res == {"https": True, "http": True, "ssh": False, "hypervisor": False, "defender": False,
+                   "langfuse": False}
 
 
 def test_control_api_needs_the_token():

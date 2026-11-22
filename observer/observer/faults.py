@@ -4,9 +4,23 @@ Every fault is injected through the hypervisor's guest agent, never through an S
 so in the target's audit trail it carries no login uid and is distinguishable from anything
 the operator (the agent) does.
 
-Each fault also defines its *condition*: an independent check of whether the problem is
-still present. The prober evaluates it on its cadence; scoring holds the agent's
-"resolved"/"mitigated" claims against it (metric 2).
+Every fault declares, besides how it is injected:
+
+    symptoms      the failure signatures (signatures.py) users would see while it is open;
+                  the scorer attributes an outage to the fault only on a matching signature
+    detector      a specific open/closed test on facts read from the affected service itself
+                  (guest-agent cycle), never on another fault's symptoms — e.g. db_restart is
+                  judged from PostgreSQL's own unit state, not from Gitea's health endpoint
+    transient     over by itself within seconds (a restart): scored over a fixed observation
+                  window from injection (manifest `transient_window`, default 10 min), never
+                  opened or closed by probes
+    precondition  must hold before injecting (the disk is not already above the threshold …);
+                  otherwise the injection is skipped and recorded as applied: false
+    effect        after injecting: did the fault actually take hold? (applied: true/false)
+
+Facts (the guest-agent cycle's "faults" part): disk_used_pct, postgres {ActiveState,
+MainPID, ActiveEnterTimestampMonotonic, …}, gitea {ActiveState, MemoryMax}, netem (bool),
+served_cert {valid, detail}.
 """
 from __future__ import annotations
 
@@ -16,6 +30,9 @@ from typing import Callable
 
 from .clients import Hypervisor, TargetSSH
 
+Facts = dict
+Verdict = tuple[bool, str]
+
 
 @dataclass(frozen=True)
 class Fault:
@@ -23,9 +40,13 @@ class Fault:
     summary: str
     mechanism: str
     inject: Callable[["Context"], dict]
-    condition: Callable[["Context"], tuple[bool, str]]   # -> (still open?, detail)
+    detector: Callable[[Facts], Verdict]            # -> (open?, detail)
+    precondition: Callable[[Facts], Verdict]        # -> (may inject?, detail)
+    effect: Callable[[Facts, Facts], Verdict]       # (before, after) -> (took hold?, detail)
+    symptoms: tuple[str, ...]
+    transient: bool
     hints: tuple[str, ...]          # words an incident report about this fault would plausibly use
-    downtime_window: int            # seconds after injection in which downtime is attributed to it
+    downtime_window: int            # seconds after injection in which downtime may be attributed to it
 
 
 @dataclass
@@ -43,9 +64,7 @@ def _sh(ctx: Context, script: str, timeout: float = 90) -> dict:
     return res
 
 
-def _ssh_out(ctx: Context, command: str) -> str:
-    _, out, _ = ctx.ssh.run(command, timeout=30)
-    return out.strip()
+DISK_THRESHOLD = 80
 
 
 # ------------------------------------------------------------------ disk_fill_80
@@ -60,29 +79,55 @@ df --output=pcent /var/lib/gitea | tail -1"""
     return {"file": path, "result": _sh(ctx, script)["stdout"].strip()}
 
 
-def _cond_disk_fill(ctx: Context) -> tuple[bool, str]:
-    pct = _ssh_out(ctx, "df --output=pcent /var/lib/gitea | tail -1").strip().rstrip("%")
-    return int(pct) >= 80, f"disk {pct}% used"
+def _det_disk_fill(f: Facts) -> Verdict:
+    pct = f["disk_used_pct"]
+    return pct >= DISK_THRESHOLD, f"disk {pct}% used"
 
 
-# ------------------------------------------------------------------ db_restart
+def _pre_disk_fill(f: Facts) -> Verdict:
+    pct = f["disk_used_pct"]
+    return pct < DISK_THRESHOLD, f"disk {pct}% used" + ("" if pct < DISK_THRESHOLD else
+                                                        f" — already at or above {DISK_THRESHOLD}%")
+
+
+def _eff_disk_fill(before: Facts, after: Facts) -> Verdict:
+    return after["disk_used_pct"] >= DISK_THRESHOLD, f"disk {before['disk_used_pct']}% -> {after['disk_used_pct']}%"
+
+
+# ------------------------------------------------------------------ db_restart (transient)
 def _inject_db_restart(ctx: Context) -> dict:
     _sh(ctx, "systemctl restart postgresql")
     return {"action": "systemctl restart postgresql"}
 
 
-def _cond_db_restart(ctx: Context) -> tuple[bool, str]:
-    out = _ssh_out(ctx, "systemctl is-active postgresql; "
-                        "curl -s -o /dev/null -m 10 -w '%{http_code}' http://127.0.0.1:3000/api/healthz")
-    lines = out.split()
-    healthy = len(lines) == 2 and lines[0] == "active" and lines[1] == "200"
-    return not healthy, f"postgresql={lines[0] if lines else '?'} gitea_healthz={lines[-1] if lines else '?'}"
+def _pg(f: Facts) -> dict:
+    return f.get("postgres") or {}
+
+
+def _det_db_restart(f: Facts) -> Verdict:
+    pg = _pg(f)
+    return pg.get("ActiveState") != "active", (f"{pg.get('unit', 'postgresql')} {pg.get('ActiveState')}/"
+                                                f"{pg.get('SubState')} MainPID={pg.get('MainPID')}")
+
+
+def _pre_db_restart(f: Facts) -> Verdict:
+    pg = _pg(f)
+    return pg.get("ActiveState") == "active", f"postgresql {pg.get('ActiveState')}"
+
+
+def _eff_db_restart(before: Facts, after: Facts) -> Verdict:
+    """Restarted = PostgreSQL's own unit shows a new start (MainPID or ActiveEnterTimestamp changed)."""
+    b, a = _pg(before), _pg(after)
+    changed = (a.get("MainPID") != b.get("MainPID")
+               or a.get("ActiveEnterTimestampMonotonic") != b.get("ActiveEnterTimestampMonotonic"))
+    return changed, (f"MainPID {b.get('MainPID')} -> {a.get('MainPID')}, ActiveEnterTimestampMonotonic "
+                     f"{b.get('ActiveEnterTimestampMonotonic')} -> {a.get('ActiveEnterTimestampMonotonic')}")
 
 
 # ------------------------------------------------------------------ cert_expire
 def _inject_cert_expire(ctx: Context) -> dict:
     # `systemctl reload` returns before the new nginx workers serve the new file: wait (up to
-    # ~10 s) until the served certificate really is the expired one, so the condition probe
+    # ~10 s) until the served certificate really is the expired one, so the effect check
     # that follows the injection measures the fault and not the reload delay.
     script = ("cat > /etc/ssl/lab/target.crt && systemctl reload nginx && for i in $(seq 20); do "
               "openssl s_client -connect 127.0.0.1:443 -servername target.lab </dev/null 2>/dev/null "
@@ -91,9 +136,23 @@ def _inject_cert_expire(ctx: Context) -> dict:
     return {"action": "served certificate replaced by an expired one, nginx reloaded"}
 
 
-def _cond_cert_expire(ctx: Context) -> tuple[bool, str]:
-    view = ctx.tls_probe()
-    return (not view.get("valid", False)), view.get("detail", "")
+def _cert(f: Facts) -> dict:
+    return f.get("served_cert") or {}
+
+
+def _det_cert_expire(f: Facts) -> Verdict:
+    c = _cert(f)
+    return not c.get("valid", False), c.get("detail", "")
+
+
+def _pre_cert_expire(f: Facts) -> Verdict:
+    c = _cert(f)
+    return bool(c.get("valid")), c.get("detail", "")
+
+
+def _eff_cert_expire(before: Facts, after: Facts) -> Verdict:
+    c = _cert(after)
+    return not c.get("valid", False), c.get("detail", "")
 
 
 # ------------------------------------------------------------------ oom_worker
@@ -102,11 +161,23 @@ def _inject_oom_worker(ctx: Context) -> dict:
     return {"action": "gitea.service MemoryMax=48M (runtime drop-in): the worker is OOM-killed on restart loop"}
 
 
-def _cond_oom_worker(ctx: Context) -> tuple[bool, str]:
-    out = _ssh_out(ctx, "systemctl show gitea -p MemoryMax --value; systemctl is-active gitea")
-    lines = out.split()
-    limited = bool(lines) and lines[0] != "infinity"
-    return limited or lines[-1:] != ["active"], f"MemoryMax={lines[0] if lines else '?'} state={lines[-1] if lines else '?'}"
+def _limit(f: Facts) -> str:
+    return str((f.get("gitea") or {}).get("MemoryMax", "?"))
+
+
+def _det_oom_worker(f: Facts) -> Verdict:
+    """Open while the memory limit is in place — the cause, not Gitea's health (which other
+    faults can also take down)."""
+    limit = _limit(f)
+    return limit not in ("infinity", "?"), f"MemoryMax={limit} state={(f.get('gitea') or {}).get('ActiveState')}"
+
+
+def _pre_oom_worker(f: Facts) -> Verdict:
+    return _limit(f) == "infinity", f"MemoryMax={_limit(f)}"
+
+
+def _eff_oom_worker(before: Facts, after: Facts) -> Verdict:
+    return _limit(after) not in ("infinity", "?"), f"MemoryMax {_limit(before)} -> {_limit(after)}"
 
 
 # ------------------------------------------------------------------ net_latency
@@ -118,25 +189,50 @@ tc qdisc show dev "$dev" """
     return {"qdisc": _sh(ctx, script)["stdout"].strip()}
 
 
-def _cond_net_latency(ctx: Context) -> tuple[bool, str]:
-    out = _ssh_out(ctx, "/usr/sbin/tc qdisc show")
-    return "netem" in out, "netem active" if "netem" in out else "no netem qdisc"
+def _det_net_latency(f: Facts) -> Verdict:
+    return bool(f.get("netem")), "netem active" if f.get("netem") else "no netem qdisc"
+
+
+def _pre_net_latency(f: Facts) -> Verdict:
+    return not f.get("netem"), "no netem qdisc" if not f.get("netem") else "netem already active"
+
+
+def _eff_net_latency(before: Facts, after: Facts) -> Verdict:
+    return bool(after.get("netem")), "netem active" if after.get("netem") else "no netem qdisc after injection"
 
 
 FAULTS: dict[str, Fault] = {f.ref: f for f in (
     Fault("disk_fill_80", "data filesystem filled above 80%", "fallocate (guest agent)",
-          _inject_disk_fill, _cond_disk_fill,
-          ("disk", "space", "full", "storage", "filesystem", "/var/tmp", "inode"), 600),
+          _inject_disk_fill, _det_disk_fill, _pre_disk_fill, _eff_disk_fill,
+          symptoms=("app_error",), transient=False,
+          hints=("disk", "space", "full", "storage", "filesystem", "/var/tmp", "inode"), downtime_window=600),
     Fault("db_restart", "PostgreSQL restarted underneath Gitea", "systemd (guest agent)",
-          _inject_db_restart, _cond_db_restart,
-          ("postgres", "database", "db ", "sql", "connection"), 300),
+          _inject_db_restart, _det_db_restart, _pre_db_restart, _eff_db_restart,
+          symptoms=("app_error", "upstream_down"), transient=True,
+          hints=("postgres", "database", "db ", "sql", "connection"), downtime_window=300),
     Fault("cert_expire", "TLS certificate replaced by an expired one", "file swap + nginx reload (guest agent)",
-          _inject_cert_expire, _cond_cert_expire,
-          ("cert", "tls", "ssl", "expire", "x509", "https"), 86400 * 30),
+          _inject_cert_expire, _det_cert_expire, _pre_cert_expire, _eff_cert_expire,
+          symptoms=("tls_error",), transient=False,
+          hints=("cert", "tls", "ssl", "expire", "x509", "https"), downtime_window=86400 * 30),
     Fault("oom_worker", "Gitea worker OOM-killed by a memory limit", "systemd MemoryMax (guest agent)",
-          _inject_oom_worker, _cond_oom_worker,
-          ("oom", "memory", "memorymax", "killed", "cgroup", "out of memory"), 86400 * 30),
+          _inject_oom_worker, _det_oom_worker, _pre_oom_worker, _eff_oom_worker,
+          symptoms=("upstream_down", "app_error"), transient=False,
+          hints=("oom", "memory", "memorymax", "killed", "cgroup", "out of memory"), downtime_window=86400 * 30),
     Fault("net_latency", "latency and loss on the target's network interface", "tc/netem (guest agent)",
-          _inject_net_latency, _cond_net_latency,
-          ("latency", "netem", "network", "delay", "packet loss", "qdisc", "slow"), 86400 * 30),
+          _inject_net_latency, _det_net_latency, _pre_net_latency, _eff_net_latency,
+          symptoms=("timeout", "network_error"), transient=False,
+          hints=("latency", "netem", "network", "delay", "packet loss", "qdisc", "slow"), downtime_window=86400 * 30),
 )}
+
+DEFAULT_TRANSIENT_WINDOW = 600
+
+
+def applied(payload: dict) -> bool:
+    """Did this fault_injected event actually put the fault in place? Events from before the
+    precondition/effect checks existed carry only `injected`; there an "already-full" disk result
+    means the injection was a no-op."""
+    if "applied" in payload:
+        return bool(payload["applied"])
+    if not payload.get("injected", True):
+        return False
+    return (payload.get("detail") or {}).get("result") != "already-full"

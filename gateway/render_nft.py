@@ -2,8 +2,10 @@
 """Render the gateway's nftables ruleset from the policy in labcontracts.network (spec 1.1).
 
 Default-drop in both directions. Only FORWARD_ALLOW crosses segments; nothing is ever
-forwarded into the observer segment; the proxy user may not connect to lab-internal
-addresses, so the proxy cannot be used as a stepping stone (SSRF) into another segment.
+forwarded into the observer segment or the users segment (the observer's client identities),
+and both have explicit, counted drops for anything the target or the defender originates
+toward them; the proxy user may not connect to lab-internal addresses, so the proxy cannot be
+used as a stepping stone (SSRF) into another segment.
 """
 from __future__ import annotations
 
@@ -13,8 +15,9 @@ import sys
 
 from labcontracts import network
 
-COUNTERS = ("to_observer_from_target", "to_observer_from_defender", "direct_from_target",
-            "direct_from_defender", "proxy_to_internal", "dropped_other")
+COUNTERS = ("to_observer_from_target", "to_observer_from_defender", "to_users_from_target",
+            "to_users_from_defender", "direct_from_target", "direct_from_defender", "proxy_to_internal",
+            "dropped_other")
 
 
 def interfaces() -> dict[str, tuple[str, str]]:
@@ -39,9 +42,13 @@ def role_of(cidr: str) -> str:
 
 def render(ifs: dict[str, tuple[str, str]], proxy_user: str) -> str:
     seg = network.SEGMENTS
+    # Placed before any accept: nothing the target or the defender originates reaches the
+    # observer segment or the users segment, whatever FORWARD_ALLOW says.
     to_observer = [
         f"    ip saddr {seg['target']} ip daddr {seg['observer']} counter name to_observer_from_target drop",
         f"    ip saddr {seg['defender']} ip daddr {seg['observer']} counter name to_observer_from_defender drop",
+        f"    ct state new ip saddr {seg['target']} ip daddr {seg['users']} counter name to_users_from_target drop",
+        f"    ct state new ip saddr {seg['defender']} ip daddr {seg['users']} counter name to_users_from_defender drop",
     ]
     lines = ["table inet lab {}", "delete table inet lab", "table inet lab {"]
     lines += [f"  counter {name} {{}}" for name in COUNTERS]
@@ -61,14 +68,13 @@ def render(ifs: dict[str, tuple[str, str]], proxy_user: str) -> str:
         lines.append(f'    iifname "{ifname}" ip daddr {own} icmp type echo-request accept')
     lines += ["  }", "",
               "  chain forward {", "    type filter hook forward priority 0; policy drop;",
-              "    ct state established,related accept", "    ct state invalid drop"]
+              "    ct state established,related accept", "    ct state invalid drop", *to_observer]
     for rule in network.FORWARD_ALLOW:
         src_if, dst_if = ifs[role_of(rule.src)][0], ifs[role_of(rule.dst)][0]
         ports = ", ".join(str(p) for p in rule.ports)
         lines.append(f'    iifname "{src_if}" oifname "{dst_if}" ip saddr {rule.src} ip daddr {rule.dst} '
                      f'{rule.proto} dport {{ {ports} }} accept  # {rule.why}')
     lines += [
-        *to_observer,
         f'    iifname "{ifs["target"][0]}" counter name direct_from_target drop',
         f'    iifname "{ifs["defender"][0]}" counter name direct_from_defender drop',
         "    counter name dropped_other drop", "  }", "",

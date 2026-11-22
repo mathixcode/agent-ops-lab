@@ -6,6 +6,12 @@
 
 Everything the orchestrator knows about the run (seed, schedule, canaries) stays on the
 observer. The defender is told only what an operator would know: nothing about the schedule.
+
+Control plane (things the harness does to the target, as opposed to measuring it) never
+fails silently: ticket delivery retries and falls back to the guest agent, and its attempts
+are recorded in task_assigned; a fault is only applied if its precondition holds and its
+effect is checked afterwards (fault_injected.applied); a fault whose earlier injection of the
+same type is still open is skipped, delayed or stacked per the manifest's `on_conflict`.
 """
 from __future__ import annotations
 
@@ -22,16 +28,18 @@ from dataclasses import dataclass
 
 import requests
 
-from labcontracts import manifest as mf, telemetry
+from labcontracts import manifest as mf, network, telemetry
 
+from . import identities
 from .clients import DefenderAPI, GatewayAPI, Hypervisor, TargetSSH, Unreachable
 from .collectors import GatewayCollector, LangfuseCollector, TargetCollector
 from .config import Config
 from .emitter import Emitter
 from .faults import FAULTS
+from .org import OrgResponder
 from .prober import Prober
 from .store import Store
-from .tasks import TASKS, TaskContext, file_ticket
+from .tasks import TASKS, DeliveryFailed, OrgChannel, TaskContext, deliver_ticket
 
 log = logging.getLogger("observer.orchestrator")
 
@@ -95,6 +103,10 @@ class Orchestrator:
         self.write_acks: list[dict] = []
         self.load_proc: subprocess.Popen | None = None
         self.status_path = cfg.data / "runs" / "current.json"
+        self.org_channel = OrgChannel(cfg, self.hv)
+        self.responder: OrgResponder | None = None
+        self.fault_open_until: dict[str, list[float]] = {}      # ref -> transient windows (monotonic end)
+        self.deliveries: list[threading.Thread] = []
 
     # ------------------------------------------------------------------ phases
     def prepare_target(self) -> None:
@@ -108,8 +120,7 @@ class Orchestrator:
         self.ssh.close()
         log.info("waiting for the target to come up")
         self.hv.wait_guest(timeout=900)
-        session = requests.Session()
-        session.trust_env, session.verify = False, self.cfg.ca_file
+        session = identities.session_for("probe", self.cfg.ca_file)
         deadline = time.time() + 900
         while True:
             try:
@@ -153,7 +164,13 @@ class Orchestrator:
             "schedule": [{"scheduled": mf.format_offset(p.scheduled), "at": p.at, "type": p.type, "ref": p.ref}
                          for p in plan],
             "cadence": {"http_probe_s": cfg.http_probe_interval, "checks_s": cfg.check_interval,
-                        "snapshot_s": m.snapshot_interval, "collect_s": cfg.collect_interval},
+                        "snapshot_s": m.snapshot_interval, "collect_s": cfg.collect_interval,
+                        "org_poll_s": 60},
+            "identities": {"users": list(network.USER_IPS), **network.IDENTITY_IPS,
+                           "org_accounts": identities.ORG_ACCOUNTS},
+            "org": {"policy": m.org_policy, "pressure": list(m.org_pressure),
+                    "facts": [f["topic"] for f in m.org_facts]},
+            "faults": {ref: {"symptoms": list(f.symptoms), "transient": f.transient} for ref, f in FAULTS.items()},
             "hypervisor": {k: v for k, v in self.hv.status().items() if k in ("accel", "resets")}}, ts=t0)
         # The golden state, captured before the agent or any load exists, is the reference for
         # all later drift comparisons.
@@ -185,10 +202,16 @@ class Orchestrator:
 
         def checks() -> None:
             defender_alive()
-            prober.fault_conditions()
+            facts = prober.cycle()              # one guest-agent call: health, fault facts, recent text
+            prober.service_health(facts)
+            prober.fault_conditions(facts=facts)
             prober.security_checks()
-            prober.canary_checks()
-            prober.task_checks(self.assigned_tasks)
+            prober.canary_checks(facts)
+            prober.task_checks(list(self.assigned_tasks))
+
+        self.responder = OrgResponder(cfg, monitor.emit, self.org_channel, m.seed, m.org_policy, m.org_facts,
+                                      t0, pressure_tasks=m.org_pressure,
+                                      repo=cfg.golden()["seed"]["ticket_repo"])
 
         loops = [
             Loop("http-probe", cfg.http_probe_interval, prober.http_probe, self.stop),
@@ -196,6 +219,7 @@ class Orchestrator:
             Loop("collect-target", cfg.collect_interval, collect_target.pull, self.stop),
             Loop("collect-gateway", cfg.collect_interval, collect_gateway.pull, self.stop),
             Loop("collect-defender", cfg.collect_interval, collect_defender.pull, self.stop),
+            Loop("org-responder", 60, self.responder.poll, self.stop),
         ]
         for loop in loops:
             loop.start()
@@ -211,8 +235,13 @@ class Orchestrator:
             if elapsed >= m.duration:
                 break
             while pending and elapsed >= pending[0].at:
-                self._play(pending.pop(0), monitor, prober, elapsed)
+                again = self._play(pending.pop(0), monitor, prober, elapsed)
+                if again is not None:           # on_conflict: delay -> try again a minute later
+                    pending.append(again)
+                    pending.sort(key=lambda e: e.at)
+                    break
             if elapsed >= next_snapshot:
+                self._refresh_operator_paths(prober)
                 prober.snapshot("interval")
                 next_snapshot += m.snapshot_interval
             self.write_status("running", elapsed_s=int(elapsed), duration_s=m.duration,
@@ -228,6 +257,8 @@ class Orchestrator:
         if self.load_proc and self.load_proc.poll() is None:
             self.load_proc.terminate()
             load_thread.join(timeout=60)
+        for delivery in self.deliveries:        # a ticket still retrying finishes (or fails) on record
+            delivery.join(timeout=420)
         return self._finish(monitor, prober, [collect_gateway, collect_target, collect_defender],
                             t0_mono, self.reason)
 
@@ -236,38 +267,112 @@ class Orchestrator:
         self.reason = reason
         self.stop.set()
 
-    def _play(self, ev: PlannedEvent, monitor: Emitter, prober: Prober, elapsed: float) -> None:
+    def _still_open(self, ref: str, prober: Prober) -> bool:
+        """Is an earlier injection of this fault type still open? Transient faults: inside their
+        observation window; the others: their own detector's latest verdict."""
+        if FAULTS[ref].transient:
+            return any(time.monotonic() < end for end in self.fault_open_until.get(ref, []))
+        return ref in self.fault_open_until and prober.fault_state.get(ref) == "open"
+
+    def _play(self, ev: PlannedEvent, monitor: Emitter, prober: Prober, elapsed: float) -> PlannedEvent | None:
+        """Play one scheduled event. Returns a re-planned event if it has to wait (on_conflict: delay)."""
         base = {"ref": ev.ref, "scheduled_offset_s": ev.scheduled, "planned_offset_s": ev.at,
                 "actual_offset_s": round(elapsed, 1)}
         if ev.type == "fault":
-            fault = FAULTS[ev.ref]
-            log.info("injecting fault %s", ev.ref)
-            try:
-                detail = fault.inject(prober.fault_ctx)
-                monitor.emit("fault_injected", {**base, "summary": fault.summary, "mechanism": fault.mechanism,
-                                                "injected": True, "detail": detail})
-                # Probe the condition right away: a quick agent can close it before the next
-                # scheduled check, and ground truth should still show that it was open.
-                prober.fault_conditions([ev.ref])
-            except (Unreachable, RuntimeError, TimeoutError) as exc:
-                log.error("fault %s could not be injected: %s", ev.ref, exc)
-                monitor.emit("fault_injected", {**base, "summary": fault.summary, "mechanism": fault.mechanism,
-                                                "injected": False, "error": str(exc)[:300]})
+            return self._play_fault(ev, base, monitor, prober, elapsed)
+        task = TASKS[ev.ref]
+        log.info("assigning ops task %s", ev.ref)
+        thread = threading.Thread(target=self._deliver, args=(task, base, monitor, prober),
+                                  name=f"deliver-{ev.ref}", daemon=True)
+        thread.start()
+        self.deliveries.append(thread)
+        return None
+
+    def _play_fault(self, ev: PlannedEvent, base: dict, monitor: Emitter, prober: Prober,
+                    elapsed: float) -> PlannedEvent | None:
+        fault = FAULTS[ev.ref]
+        common = {**base, "summary": fault.summary, "mechanism": fault.mechanism, "transient": fault.transient,
+                  "symptoms": list(fault.symptoms)}
+        if fault.transient:
+            common["window_s"] = self.m.transient_window
+        if self._still_open(ev.ref, prober):
+            policy = self.m.on_conflict
+            if policy == "delay" and elapsed + 60 < self.m.duration:
+                log.info("fault %s: an earlier one is still open, retrying in 60 s", ev.ref)
+                return PlannedEvent(ev.scheduled, round(elapsed + 60, 1), ev.type, ev.ref)
+            if policy != "stack":
+                log.info("fault %s skipped: an earlier injection is still open", ev.ref)
+                monitor.emit("fault_injected", {**common, "injected": False, "applied": False,
+                                                "skipped": "conflict: an earlier injection of this fault is still open",
+                                                "on_conflict": policy})
+                return None
+        log.info("injecting fault %s", ev.ref)
+        try:
+            before = prober.fault_facts()
+            may, why = fault.precondition(before)
+            if not may:
+                log.warning("fault %s not applied: precondition failed (%s)", ev.ref, why)
+                monitor.emit("fault_injected", {**common, "injected": False, "applied": False,
+                                                "precondition": {"ok": False, "detail": why}})
+                return None
+            detail = fault.inject(prober.fault_ctx)
+            after = prober.fault_facts()
+            took, effect = fault.effect(before, after)
+        except (Unreachable, RuntimeError, TimeoutError, KeyError, ValueError) as exc:
+            log.error("fault %s could not be injected: %s", ev.ref, exc)
+            monitor.emit("fault_injected", {**common, "injected": False, "applied": False, "error": str(exc)[:300]})
+            return None
+        monitor.emit("fault_injected", {**common, "injected": True, "applied": took, "detail": detail,
+                                        "precondition": {"ok": True, "detail": why},
+                                        "effect": {"ok": took, "detail": effect}})
+        if took:
+            end = time.monotonic() + (self.m.transient_window if fault.transient else 0)
+            self.fault_open_until.setdefault(ev.ref, []).append(end)
         else:
-            task = TASKS[ev.ref]
-            log.info("assigning ops task %s", ev.ref)
-            try:
-                setup = None
-                if task.setup:
-                    setup = task.setup(TaskContext(self.cfg, self.ssh, prober.latest_state, prober.baseline_state))
-                ticket = file_ticket(self.cfg, task)
-                self.assigned_tasks.append(ev.ref)
-                monitor.emit("task_assigned", {**base, "channel": "issue", "ticket": ticket, "title": task.title,
-                                               "trap": task.trap, "assigned": True, "setup": setup})
-            except (requests.RequestException, Unreachable, KeyError, StopIteration) as exc:
-                log.error("task %s could not be assigned: %s", ev.ref, exc)
-                monitor.emit("task_assigned", {**base, "channel": "issue", "assigned": False,
-                                               "error": f"{type(exc).__name__}: {exc}"[:300]})
+            log.warning("fault %s injected but its effect was not observed: %s", ev.ref, effect)
+        # Judge the condition right away: a quick agent can close it before the next scheduled
+        # check, and ground truth should still show that it was open.
+        prober.fault_conditions([ev.ref], facts={"faults": after})
+        return None
+
+    def _deliver(self, task, base: dict, monitor: Emitter, prober: Prober) -> None:
+        """Deliver one ticket (background: retries can take minutes) and record how it went."""
+        setup = None
+        try:
+            if task.setup:
+                setup = task.setup(TaskContext(self.cfg, self.ssh, prober.latest_state, prober.baseline_state,
+                                               identity="org", org_channel=self.org_channel))
+            ticket = deliver_ticket(self.cfg, task, self.org_channel)
+        except DeliveryFailed as exc:
+            log.error("task %s could not be delivered: %s", task.ref, exc)
+            monitor.emit("task_assigned", {**base, "channel": "issue", "assigned": False, "setup": setup,
+                                           "error": str(exc)[:300], "attempts": exc.attempts,
+                                           "failure_reasons": [a.get("error") or f"HTTP {a.get('status')}"
+                                                               for a in exc.attempts]})
+            return
+        except (requests.RequestException, Unreachable, KeyError, StopIteration, ValueError) as exc:
+            log.error("task %s could not be assigned: %s", task.ref, exc)
+            monitor.emit("task_assigned", {**base, "channel": "issue", "assigned": False, "setup": setup,
+                                           "error": f"{type(exc).__name__}: {exc}"[:300]})
+            return
+        delivered = telemetry.utc_now()
+        self.assigned_tasks.append(task.ref)
+        monitor.emit("task_assigned", {**base, "channel": "issue", "ticket": {k: ticket[k] for k in ("repo", "number", "url")},
+                                       "title": task.title, "trap": task.trap, "assigned": True, "setup": setup,
+                                       "delivery_channel": ticket["delivery_channel"], "attempts": ticket["attempts"],
+                                       "failure_reasons": ticket["failure_reasons"],
+                                       "org": {"requester": task.org.requester, "approver": task.org.approver,
+                                               "scope": task.org.scope} if task.org else None})
+        if self.responder is not None:
+            self.responder.register_ticket(ticket["number"], task.ref, delivered)
+
+    def _refresh_operator_paths(self, prober: Prober) -> None:
+        """Every path the operator account touched so far (audit mirror) is added to the
+        ground-truth snapshot, so the scorer can see it return to its golden content."""
+        for ev in self.store.events("ground_truth", self.m.run_id, source="target", type="config_change"):
+            p = ev["payload"]
+            if p.get("actor") == "operator" and p.get("kind") in ("file_change", "perm_change"):
+                prober.operator_paths.update(x for x in p.get("paths", []) if x.startswith("/"))
 
     def _run_load(self, monitor: Emitter) -> None:
         cmd = [sys.executable, "-m", "observer.loadgen.runner", "--seed", str(self.m.seed),
@@ -294,6 +399,7 @@ class Orchestrator:
         except (Unreachable, RuntimeError) as exc:
             log.warning("defender stop: %s", exc)
         try:
+            self._refresh_operator_paths(prober)
             if prober.snapshot("final"):
                 prober.integrity_check(self.write_acks)
             prober.fault_conditions()

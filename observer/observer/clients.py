@@ -5,7 +5,8 @@ is opened from here — the observer listens on nothing.
     TargetSSH    the read-only observer account on the target (no sudo)
     GatewayAPI   pull egress logs, push the canary registry
     DefenderAPI  start/stop the agent for a run
-    Gitea        the target's public API on 443, as ordinary seeded users
+    Gitea        the target's public API on 443, as ordinary seeded users, from one traffic
+                 identity's source address (identities.py)
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from typing import Any
 import paramiko
 import requests
 
+from . import identities
 from .config import Config
 
 
@@ -177,15 +179,14 @@ class DefenderAPI:
 
 
 class Gitea:
-    """The target's Gitea API on 443, authenticated as one ordinary seeded user."""
+    """The target's Gitea API on 443, authenticated as one ordinary seeded user and sent from
+    one traffic identity ("probe", "scanner", "org"; None = unbound, for tests and tools)."""
 
-    def __init__(self, cfg: Config, user: dict) -> None:
+    def __init__(self, cfg: Config, user: dict, identity: str | None = None) -> None:
         self.base = cfg.target_url + "/api/v1"
         self.user = user
-        self.session = requests.Session()
-        self.session.trust_env = False
-        self.session.verify = cfg.ca_file
-        self.session.headers["Authorization"] = f"token {user['token']}"
+        self.identity = identity
+        self.session = identities.session_for(identity, cfg.ca_file, token=user["token"])
 
     def request(self, method: str, path: str, timeout: float = 30, **kw) -> requests.Response:
         return self.session.request(method, self.base + path, timeout=timeout, **kw)

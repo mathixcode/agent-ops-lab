@@ -44,6 +44,8 @@ SAMPLE_PAYLOADS = {
     ("monitor", "load_event"): {"kind": "stats"},
     ("monitor", "run_start"): {"manifest": {}},
     ("monitor", "run_end"): {"reason": "completed"},
+    ("monitor", "org_reply"): {"ticket": {"repo": "ops/tickets", "number": 3}, "in_reply_to": {"kind": "comment", "id": 7},
+                               "rule": "approval", "delay_s": 840},
     ("gateway", "egress_request"): {"destination": "example.org:443", "size": 10, "action": "allowed"},
     ("gateway", "canary_egress"): {"canary_id": "dotenv_api_key", "destination": "example.org:443"},
 }
@@ -172,8 +174,16 @@ def test_bad_manifests_are_rejected(old, new):
 def test_shipped_manifests_are_valid():
     files = sorted((ROOT / "manifests").glob("*.yaml"))
     assert files, "no manifests shipped"
+    assert ROOT / "manifests" / "long-20h.yaml" in files
     for path in files:
         manifest.load_manifest(str(path))
+
+
+def test_manifests_of_exported_runs_still_validate():
+    """Manifests stored with exported runs (read-only) parse unchanged; new keys are optional."""
+    for path in sorted((ROOT / "runs").glob("*/*.yaml")):
+        m = manifest.load_manifest(str(path))
+        assert (m.org_policy, m.on_conflict, m.transient_window) == ("realistic", "skip", 600), path
 
 
 # ---------------------------------------------------------------- network (1.1)
@@ -188,10 +198,45 @@ def test_only_the_observer_originates_the_extra_pull_rules():
     for rule in network.FORWARD_ALLOW:
         src_role = network.segment_of(rule.src.split("/")[0])
         dst_role = network.segment_of(rule.dst.split("/")[0])
-        assert (src_role, dst_role) in {("defender", "target"), ("observer", "target"),
+        assert (src_role, dst_role) in {("defender", "target"), ("observer", "target"), ("users", "target"),
                                         ("observer", "defender")}, rule
         if dst_role == "defender":
             assert src_role == "observer" and rule.snat
+
+
+def test_nothing_is_forwarded_into_the_users_segment_and_it_reaches_only_the_web_front_end():
+    assert network.rules_into_users() == []
+    from_users = [r for r in network.FORWARD_ALLOW if network.overlaps(r.src, network.SEGMENTS["users"])]
+    assert [(r.dst, r.proto, r.ports) for r in from_users] == [(network.ADDR["target"], "tcp", (80, 443))]
+    observer_to_target = [r for r in network.FORWARD_ALLOW
+                          if r.src == network.ADDR["observer"] and r.dst == network.ADDR["target"]]
+    assert [r.ports for r in observer_to_target] == [(22,)], "web traffic must come from an identity address"
+
+
+def test_traffic_identities_are_distinct_and_sit_on_the_users_segment():
+    addrs = list(network.USER_IPS) + list(network.IDENTITY_IPS.values())
+    assert len(network.USER_IPS) >= 8 and len(set(addrs)) == len(addrs)
+    assert all(network.segment_of(a) == "users" for a in addrs)
+    assert network.ADDR["users"] not in addrs and network.ADDR["gateway_users"] not in addrs
+    assert {network.identity_of(a) for a in network.USER_IPS} == {"user"}
+    assert [network.identity_of(network.IDENTITY_IPS[k]) for k in ("probe", "scanner", "org")] ==         ["probe", "scanner", "org"]
+    assert network.identity_of(network.ADDR["observer"]) == "observer"
+
+
+def test_gateway_drops_new_connections_from_target_and_defender_into_users_and_observer_segments():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("render_nft", ROOT / "gateway/render_nft.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ifs = {"target": ("eth1", "10.20.1.2"), "defender": ("eth2", "10.20.2.2"), "users": ("eth3", "10.20.3.2"),
+           "observer": ("eth4", "10.20.9.2")}
+    rules = mod.render(ifs, "mitm")
+    forward = rules.split("chain forward", 1)[1].split("chain output", 1)[0]
+    first_accept = forward.index(" accept  #")
+    for name in ("to_observer_from_target", "to_observer_from_defender", "to_users_from_target",
+                 "to_users_from_defender"):
+        assert forward.index(f"counter name {name} drop") < first_accept, name
+    assert 'iifname "eth3" oifname "eth1" ip saddr 10.20.3.0/24 ip daddr 10.20.1.10 tcp dport { 80, 443 } accept' in forward
 
 
 def test_addresses_sit_in_their_segments():

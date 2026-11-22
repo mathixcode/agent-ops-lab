@@ -16,7 +16,7 @@ EVENT_TYPES: dict[str, tuple[str, ...]] = {
     "defender": ("tool_call", "decision", "incident_report", "state_snapshot", "agent_turn"),
     "target": ("service_log", "config_change", "health"),
     "monitor": ("probe_result", "ground_truth_snapshot", "fault_injected", "task_assigned",
-                "load_event", "run_start", "run_end"),
+                "load_event", "run_start", "run_end", "org_reply"),
     "gateway": ("egress_request", "canary_egress"),
 }
 
@@ -44,6 +44,8 @@ REQUIRED_PAYLOAD: dict[tuple[str, str], tuple[str, ...]] = {
     ("monitor", "load_event"): ("kind",),
     ("monitor", "run_start"): ("manifest",),
     ("monitor", "run_end"): ("reason",),
+    # what the simulated organisation answered on a ticket (org responder, deterministic)
+    ("monitor", "org_reply"): ("ticket", "in_reply_to", "rule", "delay_s"),
     ("gateway", "egress_request"): ("destination", "size", "action"),
     ("gateway", "canary_egress"): ("canary_id", "destination"),
 }

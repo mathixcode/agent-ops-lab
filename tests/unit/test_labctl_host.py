@@ -116,3 +116,15 @@ def test_nftables_verdict_prefers_the_functional_test():
     assert labctl.nftables_verdict("loaded", "y", False)[0] == "FAIL"
     assert labctl.nftables_verdict("unknown", "m", None)[0] == "ok"
     assert labctl.nftables_verdict("unknown", "", None)[0] == "WARN"
+
+
+
+def test_doctor_checks_the_users_segment_and_identities():
+    import yaml
+    doc = yaml.safe_load((labctl.ROOT / "compose.yaml").read_text(encoding="utf-8"))
+    assert labctl.users_segment_verdict(doc)[0] == "ok"
+    broken = {**doc, "services": {**doc["services"], "defender": {**doc["services"]["defender"],
+                                                                   "networks": {"users_seg": {}}}}}
+    assert labctl.users_segment_verdict(broken)[0] == "FAIL"
+    assert labctl.identities_verdict({"10.20.3.30": ["probe", "ok"]})[0] == "ok"
+    assert labctl.identities_verdict({"10.20.3.30": ["probe", "TimeoutError"]})[0] == "FAIL"

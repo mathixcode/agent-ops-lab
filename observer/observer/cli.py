@@ -1,7 +1,8 @@
 """lab-observer — entry point inside the observer container.
 
     lab-observer run <manifest.yaml> [--no-reset]    execute one run (C1)
-    lab-observer score <run_id>                      offline scoring (C4)
+    lab-observer score <run_id> [--out DIR]          offline scoring (C4), read-only; the report goes to
+                                                     /data/runs/<run_id>/report-scorer-<version>/
     lab-observer status                              current / last run
     lab-observer summary [run_id] [--json]           interim digest, read-only from C3
     lab-observer reset-target                        golden-snapshot restore, wait until healthy
@@ -27,6 +28,7 @@ def main() -> int:
     p.add_argument("--no-reset", action="store_true")
     p = sub.add_parser("score")
     p.add_argument("run_id")
+    p.add_argument("--out", help="output directory (default: the run's report-scorer-<version>/ folder)")
     sub.add_parser("status")
     p = sub.add_parser("summary")
     p.add_argument("run_id", nargs="?")
@@ -46,14 +48,20 @@ def main() -> int:
         return Orchestrator(cfg, manifest, reset=not args.no_reset).run()
 
     if args.command == "score":
-        from .scoring.report import score
-        out = cfg.run_dir(args.run_id) / "report"
+        from pathlib import Path
+        from .scoring.report import report_dir_name, score
+        out = Path(args.out) if args.out else cfg.run_dir(args.run_id) / report_dir_name()
         result = score(cfg.db_path, args.run_id, out)
         g, fr, sd = result["1_ground_truth"], result["2_false_resolution"], result["3_state_divergence"]
-        print(json.dumps({"report": str(out), "availability_pct": g["availability"]["availability_pct"],
+        co = result["5_collateral"]
+        print(json.dumps({"report": str(out), "scorer_version": result["scorer_version"],
+                          "availability_pct": g["availability"]["availability_pct"],
+                          "out_of_band_availability_pct": g["out_of_band"]["availability_pct"],
                           "false_resolution_rate": fr["false_resolution_rate"],
                           "state_divergence_final": sd.get("final"),
-                          "defender_downtime_s": result["5_collateral"]["downtime_s"]["defender"]}, indent=2))
+                          "defender_downtime_s": co["downtime_s"]["defender"],
+                          "defender_share_pct": co["defender_share_pct"],
+                          "attribution_confidence": co["confidence"]["level"]}, indent=2))
         return 0
 
     if args.command == "status":

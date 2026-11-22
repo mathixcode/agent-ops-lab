@@ -24,7 +24,7 @@ from labcontracts import canary, network  # noqa: E402
 PROJECT = "agentopslab"
 PROBE_IMAGE = "agentopslab/gateway"      # has python + iproute2; any lab image would do
 GATEWAY_LEG = {"target": network.ADDR["gateway_target"], "defender": network.ADDR["gateway_defender"],
-               "observer": network.ADDR["gateway_observer"]}
+               "users": network.ADDR["gateway_users"], "observer": network.ADDR["gateway_observer"]}
 
 PREAMBLE = r'''
 import json, os, socket, ssl, subprocess, sys, time, urllib.error, urllib.request
@@ -150,7 +150,12 @@ def ssh_from(segment: str, ip: str, user: str, key_role: str, key_name: str, com
 OBSERVER_SETUP = r'''
 from observer.config import Config
 from observer.clients import Hypervisor, TargetSSH
+from observer import identities
 cfg = Config(); hv = Hypervisor(cfg); target = TargetSSH(cfg)
+def web(identity="scanner"):
+    """A session to the target's web front end from one traffic identity (the observer's primary
+    address has no route to 443 — every web request leaves from an identity address)."""
+    return identities.session_for(identity, cfg.ca_file)
 def guest(script, timeout=90):
     res = hv.guest_sh(script, timeout=timeout)
     return [res["exitcode"], res["stdout"], res["stderr"][-400:]]
@@ -237,8 +242,10 @@ def smoke_run():
     assert scored.returncode == 0, scored.stdout[-2000:] + scored.stderr[-2000:]
     out = ROOT / "runs" / run_id
     from labcontracts import manifest as mf
-    report = json.loads((out / "report/metrics.json").read_text(encoding="utf-8"))
-    return {"run_id": run_id, "dir": out, "metrics": report["metrics"], "run": report["run"],
+    from observer.scoring.metrics import SCORER_VERSION
+    report_dir = out / f"report-scorer-{SCORER_VERSION}"
+    report = json.loads((report_dir / "metrics.json").read_text(encoding="utf-8"))
+    return {"run_id": run_id, "dir": out, "report": report_dir, "metrics": report["metrics"], "run": report["run"],
             "counts": report["event_counts"], "manifest": mf.RunManifest(**{
                 **report["run"]["manifest"],
                 "event_schedule": tuple(mf.ScheduledEvent(**e) for e in report["run"]["manifest"]["event_schedule"])}),
@@ -256,7 +263,7 @@ def wait_for_target(timeout: int = 600) -> None:
     ok = observer_do(f'''
 import requests
 hv.wait_guest({timeout})
-s = requests.Session(); s.trust_env = False; s.verify = cfg.ca_file
+s = web("probe")
 deadline = time.time() + {timeout}
 while time.time() < deadline:
     try:

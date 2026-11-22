@@ -2,6 +2,8 @@
 #
 #   target segment    10.20.1.0/24   target VM (.10) behind its hypervisor container (.5)
 #   defender segment  10.20.2.0/24   defender agent (.10), Langfuse trace sink (.20)
+#   users segment     10.20.3.0/24   the observer's client identities toward the target's web front
+#                                    end: simulated users .11-.18, probe .30, scanner .31, org .32
 #   observer segment  10.20.9.0/24   observer harness (.10)
 #   gateway           .2 on every segment; the only router, and the only way to the Internet
 #
@@ -21,6 +23,7 @@ x-lab-env: &lab-env
   DEFENDER_SEGMENT: 10.20.2.0/24
   OBSERVER_SEGMENT: 10.20.9.0/24
   OBSERVER_IP: 10.20.9.10
+  USERS_SEGMENT: 10.20.3.0/24
 
 x-hv: &hv
   build:
@@ -99,6 +102,8 @@ services:
         ipv4_address: 10.20.1.2
       defender_seg:
         ipv4_address: 10.20.2.2
+      users_seg:
+        ipv4_address: 10.20.3.2
       observer_seg:
         ipv4_address: 10.20.9.2
     healthcheck:
@@ -151,10 +156,11 @@ services:
       context: .
       dockerfile: observer/Dockerfile
     image: agentopslab/observer
-    cap_add: [NET_ADMIN]          # default route + its own default-deny inbound firewall
+    cap_add: [NET_ADMIN]          # routes, identity addresses, its own default-deny inbound firewall
     environment:
       <<: *lab-env
       LAB_GATEWAY_IP: 10.20.9.2
+      USERS_GATEWAY_IP: 10.20.3.2
       HV_URL: http://10.20.1.5:8080
       GATEWAY_URL: http://10.20.9.2:8081
       DEFENDER_URL: http://10.20.2.10:8090
@@ -172,6 +178,10 @@ services:
     networks:
       observer_seg:
         ipv4_address: 10.20.9.10
+      # The observer's client leg: every request to the target's web front end leaves from an
+      # identity address on this segment (see contracts/labcontracts/network.py).
+      users_seg:
+        ipv4_address: 10.20.3.10
     depends_on:
       gateway: {condition: service_healthy}
     restart: unless-stopped
@@ -328,6 +338,12 @@ networks:
     ipam:
       config:
         - subnet: 10.20.2.0/24
+  users_seg:
+    driver: macvlan
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.20.3.0/24
   observer_seg:
     driver: macvlan
     internal: true

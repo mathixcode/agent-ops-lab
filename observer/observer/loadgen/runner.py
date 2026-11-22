@@ -2,7 +2,13 @@
 
 Runs as its own process (Locust is gevent-based) and prints one JSON object per line on
 stdout; the orchestrator wraps each line into a monitor/load_event. The seed fixes the load
-pattern, so a run is reproducible.
+pattern and the account -> address mapping, so a run is reproducible.
+
+Traffic identities: every simulated account is bound to one of the users-segment addresses
+(network.USER_IPS) by a stable, seeded mapping (identities.assign_ips). Its API requests leave
+from that address; so do its git pushes, which go through a small local CONNECT tunnel bound
+to the same address (git itself cannot choose a source address). Results are reported per IP
+group, with the failure signature of every failed request (signatures.py).
 
     python -m observer.loadgen.runner --seed 42 --profile steady_with_peaks --duration 21600
 """
@@ -13,6 +19,7 @@ from gevent import monkey
 monkey.patch_all()
 
 import argparse  # noqa: E402
+import collections  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import random  # noqa: E402
@@ -24,17 +31,22 @@ import tempfile  # noqa: E402
 import time  # noqa: E402
 
 import gevent  # noqa: E402
+from gevent import socket as gsocket  # noqa: E402
+from gevent.server import StreamServer  # noqa: E402
 from locust import HttpUser, between, task  # noqa: E402
 from locust.env import Environment  # noqa: E402
 
+from observer import identities, signatures  # noqa: E402
 from observer.config import Config  # noqa: E402
 from observer.loadgen.profile import stages  # noqa: E402
 
 CFG = Config()
-USERS = [u for u in CFG.seed_users() if u["role"] == "loadgen"]
+USERS = identities.load_accounts(CFG.seed_users())
 REPOS = CFG.golden()["seed"]["load_repos"]
 WORKDIR = tempfile.mkdtemp(prefix="loadgen-")
 _next_user = iter(range(10**9))
+IP_OF: dict[str, str] = {}              # username -> source address (set in main from the seed)
+TUNNELS: dict[str, "SourceTunnel"] = {}
 
 
 def say(kind: str, **fields) -> None:
@@ -42,16 +54,120 @@ def say(kind: str, **fields) -> None:
     sys.stdout.flush()
 
 
+class SourceTunnel:
+    """A local HTTP CONNECT proxy for git: upstream connections to the target leave from one
+    source address. TLS stays end to end (git verifies the target's certificate itself)."""
+
+    def __init__(self, source_ip: str, target_ip: str, target_host: str) -> None:
+        self.source_ip, self.target_ip, self.target_host = source_ip, target_ip, target_host
+        self.server = StreamServer(("127.0.0.1", 0), self.handle)
+        self.server.start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def handle(self, client, _addr) -> None:
+        data = b""
+        while b"\r\n\r\n" not in data and len(data) < 8192:
+            chunk = client.recv(4096)
+            if not chunk:
+                return
+            data += chunk
+        parts = data.split(b"\r\n", 1)[0].decode("latin-1").split()
+        if len(parts) < 2 or parts[0] != "CONNECT" or parts[1].rsplit(":", 1)[0] not in (self.target_host, self.target_ip):
+            client.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            return
+        try:
+            upstream = gsocket.create_connection((self.target_ip, int(parts[1].rsplit(":", 1)[1])), timeout=30,
+                                                 source_address=(self.source_ip, 0))
+        except OSError as exc:
+            client.sendall(f"HTTP/1.1 502 Tunnel failed ({type(exc).__name__})\r\n\r\n".encode())
+            return
+        client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+        def pump(src, dst):
+            try:
+                while True:
+                    buf = src.recv(65536)
+                    if not buf:
+                        break
+                    dst.sendall(buf)
+            except OSError:
+                pass
+            finally:
+                try:
+                    dst.shutdown(gsocket.SHUT_WR)
+                except OSError:
+                    pass
+
+        gevent.joinall([gevent.spawn(pump, client, upstream), gevent.spawn(pump, upstream, client)])
+        upstream.close()
+
+
+class IpStats:
+    """Per-IP-group request counters, per reporting window and for the whole run."""
+
+    def __init__(self) -> None:
+        self.window: dict[str, dict] = {}
+        self.total: dict[str, dict] = {}
+
+    @staticmethod
+    def _blank() -> dict:
+        return {"requests": 0, "failures": 0, "signatures": collections.Counter(), "statuses": collections.Counter()}
+
+    def record(self, ip: str, signature: str | None, status: int | None) -> None:
+        for bucket in (self.window, self.total):
+            b = bucket.setdefault(ip, self._blank())
+            b["requests"] += 1
+            if signature:
+                b["failures"] += 1
+                b["signatures"][signature] += 1
+                if status:
+                    b["statuses"][str(status)] += 1
+
+    @staticmethod
+    def dump(bucket: dict) -> dict:
+        return {ip: {"requests": b["requests"], "failures": b["failures"], "signatures": dict(b["signatures"]),
+                     "statuses": dict(b["statuses"])} for ip, b in sorted(bucket.items())}
+
+    def take_window(self) -> dict:
+        out, self.window = self.dump(self.window), {}
+        return out
+
+
+IP_STATS = IpStats()
+
+
+def on_request(request_type, name, response_time, response_length, response=None, context=None, exception=None,
+               **_kw) -> None:
+    ip = (context or {}).get("ip", "unbound")
+    signature, status = None, None
+    code = getattr(response, "status_code", None) or None
+    if code and code >= 400:
+        status = code
+        signature, _ = signatures.classify_response(code, getattr(response, "headers", None),
+                                                    getattr(response, "content", None))
+    elif exception is not None:
+        if request_type == "GIT":
+            signature = signatures.classify_git_error(str(exception))
+        else:
+            signature, _ = signatures.classify_exception(exception)
+    IP_STATS.record(ip, signature, status)
+
+
 class GiteaUser(HttpUser):
     wait_time = between(2, 7)
 
     def on_start(self) -> None:
         self.who = USERS[next(_next_user) % len(USERS)]
+        self.ip = IP_OF[self.who["username"]]
+        identities.bind(self.client, self.ip)
         self.client.verify = CFG.ca_file
         self.client.trust_env = False
         self.client.headers["Authorization"] = f"token {self.who['token']}"
         self.rng = random.Random(f"{self.environment.parsed_seed}-{self.who['username']}")
         self.clones: dict[str, str] = {}
+
+    def context(self) -> dict:
+        return {"ip": self.ip, "user": self.who["username"]}
 
     def repo(self) -> str:
         return self.rng.choice(REPOS)
@@ -75,19 +191,24 @@ class GiteaUser(HttpUser):
         repo = self.repo()
         with self.client.get(f"/api/v1/repos/{repo}/issues?state=open&limit=10", name="browse issues",
                              timeout=30, catch_response=True) as listing:
-            issues = listing.json() if listing.status_code == 200 else []
+            try:
+                issues = listing.json() if listing.status_code == 200 else []
+            except ValueError:
+                issues = []
+            if listing.status_code >= 400 or not listing.status_code:
+                listing.failure(f"HTTP {listing.status_code}")
         if issues and self.rng.random() < 0.6:
             number = self.rng.choice(issues)["number"]
             resp = self.client.post(f"/api/v1/repos/{repo}/issues/{number}/comments", name="post comment",
                                     json={"body": f"Update from {self.who['full_name']}: still relevant."},
                                     timeout=30)
             if resp.status_code == 201:
-                say("write_ack", repo=repo, issue=number, op="comment")
+                say("write_ack", repo=repo, issue=number, op="comment", ip=self.ip)
         else:
             resp = self.client.post(f"/api/v1/repos/{repo}/issues", name="post issue", timeout=30, json={
                 "title": f"Follow-up {self.rng.getrandbits(24):06x}", "body": "Noticed while reviewing; details to follow."})
             if resp.status_code == 201:
-                say("write_ack", repo=repo, issue=resp.json()["number"], op="issue")
+                say("write_ack", repo=repo, issue=resp.json()["number"], op="issue", ip=self.ip)
 
     # ---- push ---------------------------------------------------------------------------------
     @task(1)
@@ -99,17 +220,19 @@ class GiteaUser(HttpUser):
             sha = self._git_push(repo)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
             detail = getattr(exc, "stderr", b"") or b""
-            error = RuntimeError((detail.decode("utf-8", "replace").strip().splitlines() or [type(exc).__name__])[-1][:160])
+            text = detail.decode("utf-8", "replace") if isinstance(detail, bytes) else str(detail)
+            error = RuntimeError((text.strip().splitlines() or [type(exc).__name__])[-1][:300])
             shutil.rmtree(self.clones.pop(repo, ""), ignore_errors=True)       # start from a fresh clone next time
         self.environment.events.request.fire(
             request_type="GIT", name="git push", response_time=(time.time() - started) * 1000,
-            response_length=0, exception=error, context={})
+            response_length=0, exception=error, context=self.context())
         if sha:
-            say("write_ack", repo=repo, sha=sha, op="push")
+            say("write_ack", repo=repo, sha=sha, op="push", ip=self.ip)
 
     def _git(self, cwd: str | None, *args: str) -> str:
         env = dict(os.environ, GIT_SSL_CAINFO=CFG.ca_file, GIT_TERMINAL_PROMPT="0", HOME=WORKDIR)
-        cmd = ["git", "-c", f"user.name={self.who['full_name']}", "-c", f"user.email={self.who['email']}", *args]
+        cmd = ["git", "-c", f"user.name={self.who['full_name']}", "-c", f"user.email={self.who['email']}",
+               "-c", f"http.proxy={TUNNELS[self.ip].url}", *args]
         return subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True, timeout=120).stdout.decode().strip()
 
     def _git_push(self, repo: str) -> str:
@@ -141,12 +264,17 @@ def main() -> None:
     args = ap.parse_args()
 
     random.seed(args.seed)
+    IP_OF.update(identities.assign_ips([u["username"] for u in USERS], args.seed))
+    for ip in sorted(set(IP_OF.values())):
+        TUNNELS[ip] = SourceTunnel(ip, CFG.target_ip, CFG.target_host)
     env = Environment(user_classes=[GiteaUser], host=CFG.target_url)
     env.parsed_seed = args.seed
+    env.events.request.add_listener(on_request)
     runner = env.create_local_runner()
     plan = stages(args.profile, args.duration, args.seed, args.base_users)
     say("start", profile=args.profile, seed=args.seed, base_users=args.base_users,
-        stages=[{"at": at, "users": n, "label": label} for at, n, label in plan])
+        stages=[{"at": at, "users": n, "label": label} for at, n, label in plan],
+        accounts={name: ip for name, ip in sorted(IP_OF.items())}, ip_groups=sorted(set(IP_OF.values())))
 
     started = time.time()
     previous = {"requests": 0, "failures": 0}
@@ -160,7 +288,8 @@ def main() -> None:
             rps=round(window_req / args.stats_interval, 2),
             p50_ms=int(total.get_current_response_time_percentile(0.5) or 0),
             p95_ms=int(total.get_current_response_time_percentile(0.95) or 0),
-            total_requests=total.num_requests, total_failures=total.num_failures)
+            total_requests=total.num_requests, total_failures=total.num_failures,
+            by_ip=IP_STATS.take_window())
 
     index = 0
     next_stats = args.stats_interval
@@ -189,7 +318,8 @@ def main() -> None:
         say("stop", total_requests=total.num_requests, total_failures=total.num_failures,
             by_name={name: {"requests": s.num_requests, "failures": s.num_failures,
                             "median_ms": int(s.median_response_time or 0)}
-                     for (name, _method), s in env.stats.entries.items()})
+                     for (name, _method), s in env.stats.entries.items()},
+            by_ip=IpStats.dump(IP_STATS.total))
         shutil.rmtree(WORKDIR, ignore_errors=True)
 
 

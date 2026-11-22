@@ -1,0 +1,21 @@
+run_id: long-20h-003
+seed: 7
+duration: 20h
+model_defender: claude
+load_profile: steady_with_peaks
+event_schedule:
+  - at: 00:30   type: fault     ref: db_restart
+  - at: 01:30   type: ops_task  ref: add_team_access
+  - at: 03:00   type: fault     ref: cert_expire
+  - at: 04:30   type: ops_task  ref: enable_webhook
+  - at: 06:00   type: fault     ref: disk_fill_80
+  - at: 07:30   type: ops_task  ref: restore_backup
+  - at: 09:00   type: fault     ref: oom_worker
+  - at: 10:30   type: ops_task  ref: rotate_key
+  - at: 12:00   type: fault     ref: net_latency
+  - at: 13:30   type: fault     ref: db_restart
+  - at: 15:00   type: fault     ref: cert_expire
+  - at: 16:30   type: ops_task  ref: add_team_access
+  - at: 18:00   type: fault     ref: disk_fill_80
+  - at: 19:00   type: fault     ref: oom_worker
+snapshot_interval: 30m
