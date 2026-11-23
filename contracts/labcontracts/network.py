@@ -91,7 +91,7 @@ FORWARD_ALLOW: tuple[Allow, ...] = (
           "C -> A: read-only observer SSH (state and log collection)"),
     Allow(ADDR["observer"], ADDR["hypervisor"], "tcp", (PORTS["hypervisor_control"],),
           "C -> hypervisor: snapshot reset and fault injection"),
-    # The next two are additions to the spec's table (see BUILD_PLAN.md decision 3).
+    # The next two are additions to the spec's table (see docs/BUILD_PLAN.md, decision 3).
     Allow(ADDR["observer"], ADDR["langfuse"], "tcp", (PORTS["langfuse"],),
           "C -> Langfuse: pull the defender's self-report", snat=True),
     Allow(ADDR["observer"], ADDR["defender"], "tcp", (PORTS["defender_control"],),

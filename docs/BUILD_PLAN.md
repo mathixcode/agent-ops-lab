@@ -1,13 +1,15 @@
 # Build plan — Agent Ops Lab (local pilot)
 
-Source of truth: `agent-ops-lab-spec.md`. Scope: the four components (A target, B defender,
+Source of truth: `docs/agent-ops-lab-spec.md`. Scope: the four components (A target, B defender,
 C observer, D gateway) and the Section 1 contracts, as a pilot that runs on one machine.
 Cloud deployment (spec Section 6) is out of scope; nothing here is provider-specific.
 
 ## Repo layout
 
+(The layout as planned. The current one is in `docs/DOCUMENTATION.md`, "Repository layout".)
+
 ```
-agent-ops-lab-spec.md      the spec (copied from .venv/, where it was found)
+docs/agent-ops-lab-spec.md the spec (copied from .venv/, where it was found)
 compose.yaml               the whole lab: 4 roles + Langfuse, 3 isolated segments
 labctl.py                  host CLI (run with .venv's interpreter): bootstrap / build / up / run / check
 contracts/labcontracts/    Section 1 as code: network plan, telemetry schema, run manifest, canaries
@@ -59,7 +61,7 @@ only considered done when they pass.
    "the harness observes inward": `C → Langfuse` (pull B's self-report) and `C → defender
    control port` (start/stop the agent for a run). Without them C3 could not receive `defender`
    events at all, because B may never connect to C. Source-NATed at the gateway, so B's segment
-   never sees an observer address. Flagged in NOTES.md for confirmation.
+   never sees an observer address. Flagged in docs/NOTES.md for confirmation.
 4. **Everything flows into C3 by pull.** Target (auditd, journal, health) over the read-only
    observer SSH account; gateway events over a log endpoint bound to the observer leg; defender
    events from the Langfuse API. Nothing in A/B/D ever opens a connection to C.
@@ -88,7 +90,7 @@ only considered done when they pass.
     (`- at: 00:30   type: fault   ref: …` on one line). The parser accepts that compact form
     verbatim as well as regular YAML mappings.
 12. **Canaries are visibly fake** (`FAKECANARY-…`), as instructed. Whether that makes them too
-    recognisable to the agent is an open question in NOTES.md.
+    recognisable to the agent is an open question in docs/NOTES.md.
 13. **Langfuse sits in the defender's segment** with its stores on a private backend network;
     it is the sink for B's self-report and nothing else.
 14. **Decisions and snapshots.** `decision` events come from an `intent` argument on the
@@ -98,7 +100,7 @@ only considered done when they pass.
 15. **Pacing.** The long-running agent is woken for a check-in every `DEFENDER_TICK_SECONDS`
     (default 300 s) inside one persistent session. The spec does not prescribe a pacing.
 
-Decisions made during the build that changed the plan are recorded in NOTES.md.
+Decisions made during the build that changed the plan are recorded in docs/NOTES.md.
 
 ## Pinned versions
 

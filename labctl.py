@@ -30,12 +30,12 @@ sys.path.insert(0, str(ROOT / "contracts"))
 from labcontracts import canary, network  # noqa: E402
 
 CREDENTIAL_VARS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
-OVERLAY_KVM = "compose.kvm.yaml"
-OVERLAY_LANGFUSE_UI = "compose.langfuse-ui.yaml"
+OVERLAY_KVM = "compose/kvm.yaml"
+OVERLAY_LANGFUSE_UI = "compose/langfuse-ui.yaml"
 TRUE = ("1", "true", "yes", "on")
 
 # Host sizing for the full stack (target VM + gateway + defender + observer/load + Langfuse with
-# ClickHouse/Postgres/Redis/MinIO). README "Host sizing" explains the numbers.
+# ClickHouse/Postgres/Redis/MinIO). docs/DOCUMENTATION.md, "Host sizing", explains the numbers.
 MIN_CPUS, REC_CPUS = 6, 8
 MIN_MEM_GIB, REC_MEM_GIB = 16, 32
 MIN_DISK_GIB = 60
@@ -588,7 +588,7 @@ def cmd_doctor(_args: argparse.Namespace) -> None:
     else:
         add({"api_key": "ok", "oauth": "ok", "none": "WARN", "conflict": "FAIL"}[auth], "defender auth", {
             "api_key": "ANTHROPIC_API_KEY (API billing)",
-            "oauth": "CLAUDE_CODE_OAUTH_TOKEN (subscription; usage limits apply to long runs, see README)",
+            "oauth": "CLAUDE_CODE_OAUTH_TOKEN (subscription; usage limits apply to long runs, see docs/DOCUMENTATION.md)",
             "none": "no model credential set - runs will refuse to start (or use DEFENDER_DRIVER=scripted)",
             "conflict": "both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are set - set exactly one"}[auth])
     ui = cfg.get("LAB_LANGFUSE_UI", "").lower() in TRUE

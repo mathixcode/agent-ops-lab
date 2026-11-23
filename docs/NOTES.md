@@ -1,6 +1,7 @@
 # Notes — assumptions, decisions, open questions
 
-Companion to `BUILD_PLAN.md` (design decisions) and `README.md` (how to run it).
+Companion to `docs/BUILD_PLAN.md` (design decisions), `README.md` (what the lab is, how to start it)
+and `docs/DOCUMENTATION.md` (technical reference).
 
 ## What has and has not been exercised
 
@@ -33,7 +34,7 @@ Companion to `BUILD_PLAN.md` (design decisions) and `README.md` (how to run it).
 
 ## Assumptions
 
-- **KVM or TCG.** The target uses KVM when the Docker host has `/dev/kvm` (`compose.kvm.yaml`
+- **KVM or TCG.** The target uses KVM when the Docker host has `/dev/kvm` (`compose/kvm.yaml`
   passes the device in) and QEMU's software emulation (TCG) otherwise. TCG is a full VM (own
   kernel, systemd, auditd, netem), just slower, and its latency numbers are not comparable with
   KVM runs. Correction: earlier notes said WSL2 on this machine has no `/dev/kvm`. On
@@ -66,7 +67,7 @@ Companion to `BUILD_PLAN.md` (design decisions) and `README.md` (how to run it).
 3. **The observer's root-level view of the target goes through the hypervisor** (QEMU guest
    agent), not through an SSH account: snapshot capture and fault injection. The observer's
    SSH account stays read-only and unprivileged as spec 1.2 requires. Consequence for a VM
-   deployment: an equivalent out-of-band channel is needed (README, "Later: four VMs").
+   deployment: an equivalent out-of-band channel is needed (docs/DOCUMENTATION.md, "Moving to one VM per role").
 4. **The agent has no local shell.** Its tools are exactly B.2 (shell *on the target*, files on
    the target, Gitea API, notes, incident report). The SDK's built-in Bash/Read/Write/web tools
    are disabled, because the defender container's environment holds the API key and spec
@@ -144,12 +145,12 @@ SSH. Still one host, still Docker Compose, nothing provider-specific. What chang
 - **KVM** is passed in explicitly by an overlay instead of relying only on the device-cgroup
   rule plus `mknod` (which stays as the fallback). `LAB_KVM=0` forces TCG.
 - **Subscription auth** (`CLAUDE_CODE_OAUTH_TOKEN`) next to `ANTHROPIC_API_KEY`, exactly one
-  (README, "The agent"). Enforced in three places: `labctl.py` passes only one to Compose and
+  (docs/DOCUMENTATION.md, "The agent"). Enforced in three places: `labctl.py` passes only one to Compose and
   `up` refuses if both are set; `compose.yaml` declares both without a default, so one that is
   not passed is absent in the container (checked with a throwaway container); the defender
   entrypoint unsets `ANTHROPIC_API_KEY` under OAuth and the runtime refuses to start with both.
 - **Langfuse UI**: opt-in overlay, 127.0.0.1 only, for an SSH tunnel.
-- **`status --summary`**: read-only interim digest (README, "Following a run").
+- **`status --summary`**: read-only interim digest (docs/DOCUMENTATION.md, "Following a run").
 - **Token and cost accounting**: new agent-view event `defender/agent_turn` (next section).
 - **Fault condition probed right after injection.** With KVM the first acceptance run exposed
   a race: the scripted defender fixed `cert_expire` 41 s after injection, before the next
@@ -256,7 +257,7 @@ egress policy are unchanged, and C3 is still append-only with two layers.
   "trap not avoided"). A check is inconclusive with a reason when nginx generated a 4xx where a
   different answer was expected.
 
-**2. Evidence-based attribution.** (IMPLEMENTATION.md §10, metric 5.)
+**2. Evidence-based attribution.** (docs/IMPLEMENTATION.md §10, metric 5.)
 
 - **Mixed outages: dominant signature** (most failed probes; ties to the signature closest to
   the service). Chosen over a per-probe split because it is stable against single stray
@@ -359,7 +360,7 @@ numbers (8,059.2 s defender, 617 s external, 0 unexplained).
    gaps — an unexpected exception in the run clock, in `_play_fault` or in a teardown step
    ended the process without `run_end` (defender left running), a control API's non-JSON
    answer escaped every handler, one failing check skipped the rest of the round, and setup
-   failures after registration left a run without `run_end`. All fixed (IMPLEMENTATION.md 4.1,
+   failures after registration left a run without `run_end`. All fixed (docs/IMPLEMENTATION.md 4.1,
    7.1, 7.2): status polls retried to the deadline, kill of the command tree at the deadline,
    `truncated` flag, network setup before registration, exactly one teardown, every check and
    teardown step isolated, reset retried once.
@@ -513,7 +514,7 @@ change of the attribution rules rather than a fix.
 - **WSL idle shutdown.** WSL stops its VM (and Docker, and the lab) when no `wsl.exe` process is
   attached. Containers restart on the next command, the target VM reboots onto its existing
   disk. An attached `labctl.py run` holds it open; a detached one does not. This matters for
-  the 6-hour pilot — see README.
+  the 6-hour pilot — see docs/DOCUMENTATION.md, "Windows and WSL2".
 - **Docker's `internal` bridge networks cannot be used for the segments here**: the WSL kernel
   passes bridged traffic through iptables, and Docker's rules then drop anything routed via a
   gateway container. The segments are internal *macvlan* networks instead.

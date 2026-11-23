@@ -145,8 +145,8 @@ def test_defender_entrypoint_removes_the_api_key_under_oauth():
 
 # ---------------------------------------------------------------- optional overlays
 
-KVM_OVERLAY = yaml.safe_load((ROOT / "compose.kvm.yaml").read_text(encoding="utf-8"))
-UI_OVERLAY = yaml.safe_load((ROOT / "compose.langfuse-ui.yaml").read_text(encoding="utf-8"))
+KVM_OVERLAY = yaml.safe_load((ROOT / "compose/kvm.yaml").read_text(encoding="utf-8"))
+UI_OVERLAY = yaml.safe_load((ROOT / "compose/langfuse-ui.yaml").read_text(encoding="utf-8"))
 
 
 def test_kvm_overlay_only_passes_the_kvm_device_to_the_hypervisor():

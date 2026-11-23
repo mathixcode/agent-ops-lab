@@ -78,10 +78,10 @@ def test_shell_environment_overrides_dotenv(linux_host, monkeypatch):
 
 def test_overlays_follow_kvm_and_the_langfuse_opt_in(linux_host, monkeypatch):
     monkeypatch.setattr(labctl, "host_has_kvm", lambda: True)
-    assert labctl.compose_files() == ["compose.yaml", "compose.kvm.yaml"]
+    assert labctl.compose_files() == ["compose.yaml", "compose/kvm.yaml"]
     labctl._KVM = None
     write_env(linux_host, "LAB_KVM=0\nLAB_LANGFUSE_UI=1\n")
-    assert labctl.compose_files() == ["compose.yaml", "compose.langfuse-ui.yaml"]
+    assert labctl.compose_files() == ["compose.yaml", "compose/langfuse-ui.yaml"]
     labctl._KVM = None
     monkeypatch.setattr(labctl, "host_has_kvm", lambda: False)
     write_env(linux_host, "")

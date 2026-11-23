@@ -1,6 +1,6 @@
 # How the lab is implemented
 
-A guided tour of the code: for every element of `agent-ops-lab-spec.md`, what was built,
+A guided tour of the code: for every element of `docs/agent-ops-lab-spec.md`, what was built,
 where it lives, and how it works. Read it alongside the code; file references are
 `path:line`-free on purpose so they survive edits — search for the named function or class.
 
@@ -8,10 +8,11 @@ Companion documents:
 
 | Document | Answers |
 |---|---|
-| `README.md` | How do I run it? |
-| `BUILD_PLAN.md` | Which design choices were made, and why? |
-| `NOTES.md` | What was assumed, what is limited, what is still open? |
-| **`IMPLEMENTATION.md`** (this file) | How does each part actually work? |
+| `README.md` | What is the lab, and how do I start it? |
+| `docs/DOCUMENTATION.md` | Technical reference: configuration, commands, manifests, results |
+| `docs/BUILD_PLAN.md` | Which design choices were made, and why? |
+| `docs/NOTES.md` | What was assumed, what is limited, what is still open? |
+| **`docs/IMPLEMENTATION.md`** (this file) | How does each part actually work? |
 
 Contents
 
@@ -227,8 +228,8 @@ workstation) it calls `docker` directly; only when `docker` is not on PATH and `
   `CLAUDE_CODE_OAUTH_TOKEN`. `docker_env()` removes the other one (or both, if both are set,
   and `up` refuses to start). Since `compose.yaml` declares both without a value, the one that
   is not passed is absent in the defender container.
-- **Overlays** (`compose_files()`): `compose.kvm.yaml` when the host has `/dev/kvm`
-  (`host_has_kvm()`, unless `LAB_KVM=0`), `compose.langfuse-ui.yaml` when `LAB_LANGFUSE_UI=1`.
+- **Overlays** (`compose_files()`): `compose/kvm.yaml` when the host has `/dev/kvm`
+  (`host_has_kvm()`, unless `LAB_KVM=0`), `compose/langfuse-ui.yaml` when `LAB_LANGFUSE_UI=1`.
   `compose_cmd()` puts them in front of every Compose call as `-f` options.
 - **Host scripts** (`host_run()`): shell scripts that must run on the Docker host go in on
   stdin, as bytes — `wsl.exe` mangles multi-line arguments and Windows text pipes add CRs.
@@ -283,8 +284,8 @@ comes from `.env` (git-ignored) and is passed to the defender container only.
   build's); `langfuse_backend` (internal) for Langfuse's stores. Only `langfuse-web` has a leg
   in the defender segment.
 - No service publishes a port and none mounts the Docker socket (both asserted by a unit test).
-- **Overlays**, added by `labctl.py` only: `compose.kvm.yaml` gives `target-hv` and
-  `target-build` the `/dev/kvm` device and nothing else. `compose.langfuse-ui.yaml` (opt-in)
+- **Overlays**, added by `labctl.py` only: `compose/kvm.yaml` gives `target-hv` and
+  `target-build` the `/dev/kvm` device and nothing else. `compose/langfuse-ui.yaml` (opt-in)
   publishes `langfuse-web` on `127.0.0.1:${LANGFUSE_UI_PORT:-3000}` for an SSH tunnel. Docker
   cannot publish from a container that is only on internal networks, so it adds a bridge
   network `langfuse_ui` that only `langfuse-web` joins, with
@@ -308,7 +309,7 @@ role, with KVM when the host has `/dev/kvm` and TCG emulation otherwise.
   run time, so the guest sees identical hardware: q35, virtio disk/NIC (fixed MAC), virtio-rng,
   a virtio-serial port for the **QEMU guest agent** (`qga.sock`) and a QMP socket. `accel()`
   picks `kvm` when `/dev/kvm` opens, otherwise `tcg,thread=multi`. The device comes from
-  `compose.kvm.yaml`; without the overlay `kvm_usable()` still tries to create the node itself
+  `compose/kvm.yaml`; without the overlay `kvm_usable()` still tries to create the node itself
   (allowed by the device-cgroup rule), so KVM is used whenever the host has it.
 - `target/hypervisor/entrypoint.sh run` — creates `tap0`, routes `10.20.1.10/32` to it and,
   with proxy-ARP enabled through container sysctls, makes the VM appear on the target segment
@@ -1405,7 +1406,7 @@ self-report and ground truth are never mixed."
 | Scoring | read-only handle (C3 or export); metrics 1 and 5 take only `GroundTruth`; authorship and attribution from the boundary record only (auditd, nginx logs, probes) | `scoring/` | `test_ground_truth_metrics_cannot_be_moved_by_the_agents_self_report`, `test_metric3_agent_tool_trace_cannot_establish_authorship`, `test_scoring_reads_each_layer_from_its_own_table` |
 | Usage accounting | `agent_turn` is a `defender` type → agent-view table only; no metric reads it | `telemetry.py`, `store.py`, `metrics.usage` | `test_agent_turn_cost_may_be_unknown_and_belongs_to_the_agent_view`, `test_usage_never_moves_a_ground_truth_or_correctness_metric`, live `test_usage_is_mirrored_into_the_agent_view_only` |
 | Live summary | reads C3 read-only via `docker compose exec`; no write, no connection into C | `summary.py`, `labctl.py status --summary` | `test_live_summary_reads_c3_read_only_and_marks_teardown_metrics_pending`, live `test_live_summary_reads_the_datastore_without_changing_it` |
-| Host exposure | no published ports; the Langfuse UI opt-in binds 127.0.0.1 only, on a network only `langfuse-web` joins | `compose.yaml`, `compose.langfuse-ui.yaml` | `test_no_service_publishes_ports_or_mounts_the_docker_socket`, `test_langfuse_ui_overlay_binds_loopback_only_and_touches_nothing_else` |
+| Host exposure | no published ports; the Langfuse UI opt-in binds 127.0.0.1 only, on a network only `langfuse-web` joins | `compose.yaml`, `compose/langfuse-ui.yaml` | `test_no_service_publishes_ports_or_mounts_the_docker_socket`, `test_langfuse_ui_overlay_binds_loopback_only_and_touches_nothing_else` |
 
 ---
 
@@ -1517,7 +1518,7 @@ executes (or reuses via `LAB_ACCEPT_RUN_ID`) one dummy run for the observer and 
 | 2 metrics | `scoring/metrics.py` (section 10 above) |
 | 3 pilot | `manifests/pilot-6h.yaml` |
 | 4 safety | fake canaries (`canary.py`), model credential only via `.env` (exactly one), `tools=[]`, no attacker code |
-| — single-host deployment | `labctl.py` (`doctor`, overlays, credential rule), `scripts/host-setup.sh`, `compose.kvm.yaml`, `compose.langfuse-ui.yaml` |
+| — single-host deployment | `labctl.py` (`doctor`, overlays, credential rule), `scripts/host-setup.sh`, `compose/kvm.yaml`, `compose/langfuse-ui.yaml` |
 | — traffic identities | `contracts/labcontracts/network.py`, `observer/observer/identities.py`, `observer/entrypoint.sh`, `compose.yaml` |
 | — evidence-based attribution | `observer/observer/signatures.py`, `scoring/timeline.py`, `scoring/metrics.py` (`collateral`, `Attributor`), `collectors.py` (nginx record), `faults.py` |
 | — org simulator | `observer/observer/org.py`, `tasks.py` (`OrgSpec`, `OrgChannel`), manifest `org_*` |
@@ -1547,6 +1548,6 @@ executes (or reuses via `LAB_ACCEPT_RUN_ID`) one dummy run for the observer and 
 | change probe/collect cadence | `PROBE_INTERVAL`, `CHECK_INTERVAL`, `COLLECT_INTERVAL` in the observer's environment |
 | allow a new network flow | `FORWARD_ALLOW` in `network.py`. Never with a destination in the observer segment; the unit tests will refuse it |
 | watch more on the target | `target/provision/files/audit-lab.rules` and/or `FILE_GLOBS` in `guest_snapshot.py`, then rebuild the golden image |
-| change how "the agent knows" is judged | `describe_key()` / `notes_mention()` in `scoring/metrics.py` (the weakest heuristic; see NOTES.md) |
+| change how "the agent knows" is judged | `KNOWS_JUDGE` (default `keyword_knows()`, fed by `describe_key()`'s notes_terms) in `scoring/metrics.py` (the weakest heuristic; see docs/NOTES.md) |
 | add a model-agnostic agent (OpenHands) | a new driver next to `sdk_driver.py` that calls the `Telemetry` methods (including `agent_turn` with a `UsageMeter`); select it in `runtime.Run` |
-| move to four VMs | README, "Later: four VMs"; re-implement `observer/observer/clients.py:Hypervisor` against the provider |
+| move to four VMs | docs/DOCUMENTATION.md, "Moving to one VM per role"; re-implement `observer/observer/clients.py:Hypervisor` against the provider |

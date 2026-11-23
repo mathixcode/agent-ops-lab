@@ -1,4 +1,4 @@
-# Agent Ops Lab — local pilot. Four roles on three isolated segments (spec 1.1).
+# Agent Ops Lab — local pilot. Four roles on four isolated segments (spec 1.1).
 #
 #   target segment    10.20.1.0/24   target VM (.10) behind its hypervisor container (.5)
 #   defender segment  10.20.2.0/24   defender agent (.10), Langfuse trace sink (.20)
@@ -12,8 +12,8 @@
 # Addresses and ports mirror contracts/labcontracts/network.py (a unit test keeps them equal).
 #
 # Start it through labctl.py, which supplies .lab/lab.env and the settings from .env, and adds
-# two optional overlays: compose.kvm.yaml (when the host has /dev/kvm) and
-# compose.langfuse-ui.yaml (opt-in, LAB_LANGFUSE_UI=1; Langfuse UI on 127.0.0.1 only).
+# two optional overlays: compose/kvm.yaml (when the host has /dev/kvm) and
+# compose/langfuse-ui.yaml (opt-in, LAB_LANGFUSE_UI=1; Langfuse UI on 127.0.0.1 only).
 name: agentopslab
 
 x-lab-env: &lab-env
@@ -30,7 +30,7 @@ x-hv: &hv
     context: .
     dockerfile: target/hypervisor/Dockerfile
   image: agentopslab/target-hypervisor
-  # /dev/net/tun (and /dev/kvm, if compose.kvm.yaml does not pass it in) are created inside the
+  # /dev/net/tun (and /dev/kvm, if compose/kvm.yaml does not pass it in) are created inside the
   # container when the host offers them; these rules allow it.
   device_cgroup_rules:
     - "c 10:200 rwm"
@@ -124,7 +124,7 @@ services:
       <<: *lab-env
       LAB_GATEWAY_IP: 10.20.2.2
       # Model credentials, passed through from labctl's environment and left UNSET in the
-      # container when labctl does not pass them. labctl passes exactly one (README, "The agent").
+      # container when labctl does not pass them. labctl passes exactly one (docs/DOCUMENTATION.md, "The agent").
       ANTHROPIC_API_KEY:
       CLAUDE_CODE_OAUTH_TOKEN:
       DEFENDER_DRIVER: ${DEFENDER_DRIVER:-sdk}
