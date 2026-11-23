@@ -11,12 +11,15 @@ read-only.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any, Iterator
 
 from labcontracts import telemetry
+
+log = logging.getLogger("observer.store")
 
 LAYERS = {
     "agent_view": ("agent_view_events", telemetry.AGENT_VIEW_SOURCES),
@@ -65,6 +68,7 @@ class Store:
         self.path = Path(path)
         self.readonly = readonly
         self._lock = threading.RLock()
+        self.collisions: dict[tuple[str, str], int] = {}        # (run_id, source) -> events not stored
         if readonly:
             self._db = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, check_same_thread=False)
         else:
@@ -95,7 +99,25 @@ class Store:
             self._db.executemany(
                 f"INSERT OR IGNORE INTO {table} (run_id, ts, source, type, seq, payload, ingested_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
-            return self._db.total_changes - before
+            inserted = self._db.total_changes - before
+            if inserted < len(rows):
+                self._check_ignored(table, rows)
+            return inserted
+
+    def _check_ignored(self, table: str, rows: list[tuple]) -> None:
+        """INSERT OR IGNORE is how re-pulled events (overlapping collector windows) are made
+        idempotent. An ignored row whose content differs from the stored one is not a re-pull
+        but a sequence-number collision — a different event lost. Never silent: logged and
+        counted per (run, source); the orchestrator reports the count in run_end."""
+        for run_id, ts, source, type_, seq, payload, _ in rows:
+            row = self._db.execute(f"SELECT ts, type, payload FROM {table} WHERE run_id = ? AND source = ? AND seq = ?",
+                                   (run_id, source, seq)).fetchone()
+            if row is None or (row["ts"], row["type"], row["payload"]) == (ts, type_, payload):
+                continue
+            key = (run_id, source)
+            self.collisions[key] = self.collisions.get(key, 0) + 1
+            log.warning("seq collision in %s: %s/%s seq %d already holds a different %s event; the new %s "
+                        "event was not stored", table, run_id, source, seq, row["type"], type_)
 
     def append_ground_truth(self, *events: dict[str, Any]) -> int:
         """Independent record: prober, orchestrator, auditd/journal, gateway."""
@@ -107,13 +129,19 @@ class Store:
 
     # ------------------------------------------------------------------ reading
     def events(self, layer: str, run_id: str, source: str | None = None,
-               type: str | None = None) -> Iterator[dict[str, Any]]:
+               type: str | None = None, min_seq: int | None = None) -> Iterator[dict[str, Any]]:
+        """Events of one run in time order. `min_seq` (with `source`: seq is per source) reads
+        only events after a point already seen — for consumers that poll during a run."""
         table, _ = LAYERS[layer]
         sql, args = f"SELECT ts, run_id, source, type, seq, payload FROM {table} WHERE run_id = ?", [run_id]
         if source:
             sql, args = sql + " AND source = ?", args + [source]
         if type:
             sql, args = sql + " AND type = ?", args + [type]
+        if min_seq is not None:
+            if not source:
+                raise ValueError("min_seq needs a source (seq is per source)")
+            sql, args = sql + " AND seq >= ?", args + [min_seq]
         with self._lock:
             rows = self._db.execute(sql + " ORDER BY ts, source, seq", args).fetchall()
         for row in rows:

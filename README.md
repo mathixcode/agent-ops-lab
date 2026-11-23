@@ -146,7 +146,9 @@ python labctl.py score smoke-001              # metrics report -> runs/smoke-001
 
 `labctl.py run` stays attached and prints the orchestrator's log; `--detach` leaves it running
 in the background. Every run needs a new `run_id` (edit the manifest): the datastore is
-append-only and refuses to reuse one.
+append-only and refuses to reuse one. One run at a time: while a run is in progress, a second
+`run` — or `reset-target` — is refused (exit 3) with the run that holds the lab; a run that
+crashed never blocks the next one.
 
 A run does this: stop the agent → restore the target from the golden snapshot → take the
 baseline ground-truth snapshot → start the agent → play load and the seeded event schedule
@@ -246,7 +248,7 @@ modified, so the original report stays next to any re-score (`--from-c3` scores 
 datastore instead):
 
 ```sh
-python labctl.py score long-20h-003     # -> scores/long-20h-003/report-scorer-2.0.0/
+python labctl.py score long-20h-003     # -> scores/long-20h-003/report-scorer-2.1.0/
 ```
 
 | File | Content |

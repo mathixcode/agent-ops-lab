@@ -13,6 +13,15 @@ group carries traffic even when fewer users run than there are accounts, and the
 does not change. Results are reported per IP group, with the failure signature of every
 failed request (signatures.py).
 
+Pushes: every Locust user keeps its own working copies (two users acting as the same account
+never share a directory). A push rejected as non-fast-forward — another push landed first —
+is fetched and pushed again, as a person would; one that keeps losing the race is counted as a
+`conflict`, not as a failure: the service answered correctly.
+
+The process ends by itself after --duration, on SIGTERM, and when the orchestrator that
+started it is gone (its parent changed, or its stdout pipe is closed) — it never keeps loading
+the target on its own.
+
     python -m observer.loadgen.runner --seed 42 --profile steady_with_peaks --duration 21600
 """
 from __future__ import annotations
@@ -51,11 +60,21 @@ _next_user = iter(range(10**9))
 IP_OF: dict[str, str] = {}              # username -> source address (set in main from the seed)
 TUNNELS: dict[str, "SourceTunnel"] = {}
 ADAPTERS: dict[str, identities.SourceAddressAdapter] = {}    # one connection pool per address
+TUNNEL_IDLE_S = 150         # > git's own 120 s budget: the git subprocess timeout decides, never the tunnel
+PUSH_ATTEMPTS = 3           # a push that loses the race against other pushes is fetched and retried
+STOPPING: list[bool] = []   # set on SIGTERM, a lost parent or a closed stdout
+
+
+class PushConflict(Exception):
+    """Every push attempt was rejected as non-fast-forward (other pushes kept landing first)."""
 
 
 def say(kind: str, **fields) -> None:
-    sys.stdout.write(json.dumps({"kind": kind, **fields}) + "\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(json.dumps({"kind": kind, **fields}) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):      # the orchestrator is gone: stop instead of loading on
+        STOPPING.append(True)
 
 
 class SourceTunnel:
@@ -86,6 +105,10 @@ class SourceTunnel:
             client.sendall(f"HTTP/1.1 502 Tunnel failed ({type(exc).__name__})\r\n\r\n".encode())
             return
         client.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        # Idle limit for the relay (the connect above keeps its 30 s): longer than git's own
+        # budget, so a slow but working server is never cut off by the tunnel.
+        upstream.settimeout(TUNNEL_IDLE_S)
+        client.settimeout(TUNNEL_IDLE_S)
 
         def pump(src, dst):
             try:
@@ -115,13 +138,16 @@ class IpStats:
 
     @staticmethod
     def _blank() -> dict:
-        return {"requests": 0, "failures": 0, "signatures": collections.Counter(), "statuses": collections.Counter()}
+        return {"requests": 0, "failures": 0, "conflicts": 0, "signatures": collections.Counter(),
+                "statuses": collections.Counter()}
 
-    def record(self, ip: str, signature: str | None, status: int | None) -> None:
+    def record(self, ip: str, signature: str | None, status: int | None, conflict: bool = False) -> None:
         for bucket in (self.window, self.total):
             b = bucket.setdefault(ip, self._blank())
             b["requests"] += 1
-            if signature:
+            if conflict:
+                b["conflicts"] += 1
+            elif signature:
                 b["failures"] += 1
                 b["signatures"][signature] += 1
                 if status:
@@ -129,8 +155,9 @@ class IpStats:
 
     @staticmethod
     def dump(bucket: dict) -> dict:
-        return {ip: {"requests": b["requests"], "failures": b["failures"], "signatures": dict(b["signatures"]),
-                     "statuses": dict(b["statuses"])} for ip, b in sorted(bucket.items())}
+        return {ip: {"requests": b["requests"], "failures": b["failures"], "conflicts": b["conflicts"],
+                     "signatures": dict(b["signatures"]), "statuses": dict(b["statuses"])}
+                for ip, b in sorted(bucket.items())}
 
     def take_window(self) -> dict:
         out, self.window = self.dump(self.window), {}
@@ -143,6 +170,9 @@ IP_STATS = IpStats()
 def on_request(request_type, name, response_time, response_length, response=None, context=None, exception=None,
                **_kw) -> None:
     ip = (context or {}).get("ip", "unbound")
+    if (context or {}).get("conflict"):
+        IP_STATS.record(ip, None, None, conflict=True)
+        return
     signature, status = None, None
     code = getattr(response, "status_code", None) or None
     if code and code >= 400:
@@ -232,17 +262,24 @@ class GiteaUser(HttpUser):
         self.act_as_next()
         repo = self.repo()
         started = time.time()
-        error, sha = None, None
+        error, sha, conflict = None, None, False
         try:
             sha = self._git_push(repo)
+        except PushConflict:
+            conflict = True                        # the service answered correctly every time
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-            detail = getattr(exc, "stderr", b"") or b""
-            text = detail.decode("utf-8", "replace") if isinstance(detail, bytes) else str(detail)
-            error = RuntimeError((text.strip().splitlines() or [type(exc).__name__])[-1][:300])
+            text = _stderr_text(exc)
+            # The failure is classified from this message (signatures.classify_git_error): keep
+            # every line that names an HTTP status or a rejection, plus git's last line.
+            lines = text.strip().splitlines()
+            keep = [l for l in lines if "returned error" in l or "rejected" in l]
+            last = lines[-1] if lines else type(exc).__name__
+            error = RuntimeError(" | ".join(dict.fromkeys([*keep, last]))[:300])
             shutil.rmtree(self.clones.pop(f"{self.who['username']}:{repo}", ""), ignore_errors=True)   # fresh clone next time
         self.environment.events.request.fire(
             request_type="GIT", name="git push", response_time=(time.time() - started) * 1000,
-            response_length=0, exception=error, context=self.context())
+            response_length=0, exception=error,
+            context={**self.context(), **({"conflict": True} if conflict else {})})
         if sha:
             say("write_ack", repo=repo, sha=sha, op="push", ip=self.ip)
 
@@ -253,23 +290,40 @@ class GiteaUser(HttpUser):
         return subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True, timeout=120).stdout.decode().strip()
 
     def _git_push(self, repo: str) -> str:
+        """Append a line to CHANGELOG.md and push it. The working copy belongs to this Locust
+        user alone (index in the path): two users acting as the same account at the same time
+        never share a directory. A non-fast-forward rejection is fetched and retried."""
         key = f"{self.who['username']}:{repo}"
-        clone = self.clones.get(key)
-        if clone is None:
-            clone = os.path.join(WORKDIR, f"{self.who['username']}-{repo.replace('/', '_')}")
-            shutil.rmtree(clone, ignore_errors=True)
-            url = f"https://{self.who['username']}:{self.who['token']}@{CFG.target_host}/{repo}.git"
-            self._git(None, "clone", "-q", "--depth", "1", url, clone)
-            self.clones[key] = clone
-        else:
-            self._git(clone, "fetch", "-q", "--depth", "1", "origin", "main")
-            self._git(clone, "reset", "-q", "--hard", "FETCH_HEAD")
-        with open(os.path.join(clone, "CHANGELOG.md"), "a", encoding="utf-8") as fh:
-            fh.write(f"- {time.strftime('%Y-%m-%d %H:%M:%S')} {self.who['username']}: routine update\n")
-        self._git(clone, "add", "CHANGELOG.md")
-        self._git(clone, "commit", "-q", "-m", "Update changelog")
-        self._git(clone, "push", "-q", "origin", "HEAD:main")
-        return self._git(clone, "rev-parse", "HEAD")
+        for attempt in range(1, PUSH_ATTEMPTS + 1):
+            clone = self.clones.get(key)
+            if clone is None:
+                clone = os.path.join(WORKDIR, f"w{self.index}-{self.who['username']}-{repo.replace('/', '_')}")
+                shutil.rmtree(clone, ignore_errors=True)
+                url = f"https://{self.who['username']}:{self.who['token']}@{CFG.target_host}/{repo}.git"
+                self._git(None, "clone", "-q", "--depth", "1", url, clone)
+                self.clones[key] = clone
+            else:
+                self._git(clone, "fetch", "-q", "--depth", "1", "origin", "main")
+                self._git(clone, "reset", "-q", "--hard", "FETCH_HEAD")
+            with open(os.path.join(clone, "CHANGELOG.md"), "a", encoding="utf-8") as fh:
+                fh.write(f"- {time.strftime('%Y-%m-%d %H:%M:%S')} {self.who['username']}: routine update\n")
+            self._git(clone, "add", "CHANGELOG.md")
+            self._git(clone, "commit", "-q", "-m", "Update changelog")
+            try:
+                self._git(clone, "push", "-q", "origin", "HEAD:main")
+            except subprocess.CalledProcessError as exc:
+                if signatures.classify_git_error(_stderr_text(exc)) != "conflict":
+                    raise
+                if attempt == PUSH_ATTEMPTS:
+                    raise PushConflict(repo) from exc
+                continue                            # fetch the newer main and try again
+            return self._git(clone, "rev-parse", "HEAD")
+        raise PushConflict(repo)
+
+
+def _stderr_text(exc: BaseException) -> str:
+    detail = getattr(exc, "stderr", b"") or b""
+    return detail.decode("utf-8", "replace") if isinstance(detail, bytes) else str(detail)
 
 
 def main() -> None:
@@ -311,10 +365,12 @@ def main() -> None:
 
     index = 0
     next_stats = args.stats_interval
-    stopping = []
-    gevent.signal_handler(signal.SIGTERM, lambda: stopping.append(True))
+    parent = os.getppid()
+    gevent.signal_handler(signal.SIGTERM, lambda: STOPPING.append(True))
     try:
-        while not stopping:
+        while not STOPPING:
+            if os.getppid() != parent:          # the orchestrator died: never load the target on our own
+                break
             elapsed = time.time() - started
             if elapsed >= args.duration:
                 break

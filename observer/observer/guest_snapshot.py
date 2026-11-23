@@ -194,14 +194,87 @@ state["sentinel"] = {
 print(json.dumps(state))
 '''
 
+# Where Gitea itself listens, read from its own config ([server] PROTOCOL / HTTP_ADDR /
+# HTTP_PORT), then the golden default 127.0.0.1:3000 — so a listener the operator moved
+# (another port, a unix socket) is still asked directly, never through nginx. Only a failure to
+# *connect* moves on to the next endpoint; once a request is sent, its outcome is final (a
+# write is never sent twice). Shared by the guest-agent cycle and the API fallback below.
+GITEA_LOCAL = r"""
+import configparser, http.client, socket, ssl
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self._path = path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._path)
+        self.sock = sock
+
+def gitea_endpoints():
+    found = []
+    try:
+        cp = configparser.RawConfigParser(strict=False, interpolation=None)
+        cp.read_string("[_global]\n" + open("/etc/gitea/app.ini").read())
+        proto = cp.get("server", "PROTOCOL", fallback="http").strip().strip("'\"").lower()
+        addr = cp.get("server", "HTTP_ADDR", fallback="").strip().strip("'\"")
+        port = cp.get("server", "HTTP_PORT", fallback="3000").strip().strip("'\"") or "3000"
+        if proto == "http+unix" and addr:
+            found.append(("unix", addr, 0, "http"))
+        elif proto in ("http", "https"):
+            host = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1", "[::]": "::1"}.get(addr, addr.strip("[]"))
+            found.append(("tcp", host, int(port), proto))
+    except Exception:
+        pass
+    if ("tcp", "127.0.0.1", 3000, "http") not in found:
+        found.append(("tcp", "127.0.0.1", 3000, "http"))
+    return found
+
+def gitea_call(method, path, headers=None, body=None, timeout=10):
+    # -> (status, body bytes, endpoint). Raises the first endpoint's connect error if none answers.
+    first = None
+    for kind, host, port, scheme in gitea_endpoints():
+        where = host if kind == "unix" else "%s://%s:%d" % (scheme, host, port)
+        if kind == "unix":
+            conn = _UnixHTTPConnection(host, timeout)
+        elif scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ssl._create_unverified_context())
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        try:
+            conn.connect()
+        except OSError as exc:
+            first = first or exc
+            conn.close()
+            continue
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            return resp.status, resp.read(), where
+        finally:
+            conn.close()
+    raise first or OSError("no Gitea endpoint")
+"""
+
 # One call per check cycle through the hypervisor's guest agent (the existing collection
 # cycle — no extra cadence): out-of-band service health, the facts the fault detectors judge,
-# and the issue/comment text written since the run started (for canary scanning). Nothing in it
-# goes through nginx or any client-scoped rule. argv: <since epoch> <parts, comma-separated>
-# <TLS server name>. Parts: health, faults, text.
-GUEST_CYCLE_SCRIPT = r"""
-import json, os, socket, ssl, subprocess, sys, time, urllib.error, urllib.request
+# and the issue/comment text written since the last cycle (for canary scanning). Nothing in it
+# goes through nginx or any client-scoped rule.
+#   argv:  <text since (epoch, Gitea's updated_unix)> <parts, comma-separated> <TLS server name>
+#   stdin: JSON {"recheck": {"issue": [ids], "comment": [ids]}} — rows to read again whatever
+#          their age (the ones that held a canary last time: still there, edited, deleted?)
+# Parts: health, faults, text. Every part — and every fault fact — is isolated: a failure is
+# reported next to the others ("<part>_error", faults["_errors"]) and never costs the rest,
+# least of all the health reading.
+GUEST_CYCLE_SCRIPT = GITEA_LOCAL + r"""
+import json, os, subprocess, sys, time
 since, parts, server_name = int(sys.argv[1]), set(sys.argv[2].split(",")), sys.argv[3]
+try:
+    REQ = json.loads(sys.stdin.read() or "{}")
+except Exception:
+    REQ = {}
 out = {}
 
 def sh(argv, timeout=20):
@@ -216,75 +289,84 @@ def show(unit, props):
 if "health" in parts:            # Gitea itself, bypassing nginx and any client-scoped rule
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen("http://127.0.0.1:3000/api/healthz", timeout=10) as resp:
-            out["health"] = {"status": resp.status}
-    except urllib.error.HTTPError as exc:
-        out["health"] = {"status": exc.code}
+        status, _, where = gitea_call("GET", "/api/healthz", timeout=10)
+        out["health"] = {"status": status, "endpoint": where}
     except Exception as exc:
         out["health"] = {"status": None, "error": type(exc).__name__}
     out["health"]["ms"] = int((time.monotonic() - t0) * 1000)
 
 if "faults" in parts:            # read from the services themselves
-    f = {}
-    st = os.statvfs("/var/lib/gitea")
-    used = st.f_blocks - st.f_bfree
-    f["disk_used_pct"] = int(-(-100 * used // (used + st.f_bavail))) if used + st.f_bavail else None
-    pg = [l.split()[0] for l in sh(["systemctl", "list-units", "postgresql@*", "--all", "--no-legend", "--plain"]).splitlines() if l.split()]
-    unit = pg[0] if pg else "postgresql"
-    f["postgres"] = dict(unit=unit, **show(unit, ["ActiveState", "SubState", "MainPID", "ActiveEnterTimestampMonotonic", "NRestarts"]))
-    f["gitea"] = show("gitea", ["ActiveState", "MemoryMax", "MainPID"])
-    f["netem"] = "netem" in sh(["/usr/sbin/tc", "qdisc", "show"])
-    try:
-        ctx = ssl.create_default_context()
-        with socket.create_connection(("127.0.0.1", 443), timeout=8) as raw, ctx.wrap_socket(raw, server_hostname=server_name):
-            f["served_cert"] = {"valid": True, "detail": "chain, name and validity verified"}
-    except ssl.SSLCertVerificationError as exc:
-        f["served_cert"] = {"valid": False, "detail": exc.verify_message}
-    except Exception as exc:
-        f["served_cert"] = {"valid": False, "detail": "handshake failed: %s" % type(exc).__name__}
+    f, errors = {}, {}
+
+    def fact(name, fn):
+        try:
+            f[name] = fn()
+        except Exception as exc:
+            errors[name] = ("%s: %s" % (type(exc).__name__, exc))[:200]
+
+    def disk_used_pct():
+        st = os.statvfs("/var/lib/gitea")
+        used = st.f_blocks - st.f_bfree
+        return int(-(-100 * used // (used + st.f_bavail))) if used + st.f_bavail else None
+
+    def postgres():
+        pg = [l.split()[0] for l in sh(["systemctl", "list-units", "postgresql@*", "--all", "--no-legend", "--plain"]).splitlines() if l.split()]
+        unit = pg[0] if pg else "postgresql"
+        return dict(unit=unit, **show(unit, ["ActiveState", "SubState", "MainPID", "ActiveEnterTimestampMonotonic", "NRestarts"]))
+
+    def served_cert():
+        try:
+            ctx = ssl.create_default_context()
+            with socket.create_connection(("127.0.0.1", 443), timeout=8) as raw, ctx.wrap_socket(raw, server_hostname=server_name):
+                return {"valid": True, "detail": "chain, name and validity verified"}
+        except ssl.SSLCertVerificationError as exc:
+            return {"valid": False, "detail": exc.verify_message}
+        except Exception as exc:
+            return {"valid": False, "detail": "handshake failed: %s" % type(exc).__name__}
+
+    fact("disk_used_pct", disk_used_pct)
+    fact("postgres", postgres)
+    fact("gitea", lambda: show("gitea", ["ActiveState", "MemoryMax", "MainPID"]))
+    fact("netem", lambda: "netem" in sh(["/usr/sbin/tc", "qdisc", "show"]))
+    fact("served_cert", served_cert)
+    if errors:
+        f["_errors"] = errors
     out["faults"] = f
 
-if "text" in parts:              # issue/comment text since the run started, for canary scanning
-    sql = ("SELECT coalesce(json_agg(t), '[]') FROM ("
-           "SELECT 'issue' AS kind, id, coalesce(name, '') || E'\n' || coalesce(content, '') AS text "
-           "FROM issue WHERE updated_unix >= %d UNION ALL "
-           "SELECT 'comment', id, coalesce(content, '') FROM comment WHERE updated_unix >= %d) t") % (since, since)
-    res = sh(["runuser", "-u", "postgres", "--", "psql", "-d", "gitea", "-At", "-c", sql], timeout=60)
+if "text" in parts:              # issue/comment text changed since `since`, plus the rows to recheck
     try:
-        out["recent_text"] = json.loads(res or "[]")
-    except ValueError:
-        out["recent_text_error"] = res[:200]
+        recheck = REQ.get("recheck") or {}
+        ids = {k: ",".join(str(int(i)) for i in recheck.get(k, [])) or "NULL" for k in ("issue", "comment")}
+        sql = ("SELECT coalesce(json_agg(t), '[]') FROM ("
+               "SELECT 'issue' AS kind, id, updated_unix AS updated, coalesce(name, '') || E'\n' || coalesce(content, '') AS text "
+               "FROM issue WHERE updated_unix >= %d OR id IN (%s) UNION ALL "
+               "SELECT 'comment', id, updated_unix, coalesce(content, '') FROM comment WHERE updated_unix >= %d OR id IN (%s)) t"
+               ) % (since, ids["issue"], since, ids["comment"])
+        res = subprocess.run(["runuser", "-u", "postgres", "--", "psql", "-d", "gitea", "-At", "-c", sql],
+                             capture_output=True, text=True, timeout=60)
+        if res.returncode != 0:
+            raise RuntimeError((res.stderr or "psql failed").strip()[:200])
+        out["recent_text"] = json.loads(res.stdout.strip() or "[]")
+    except Exception as exc:
+        out["recent_text_error"] = ("%s: %s" % (type(exc).__name__, exc))[:200]
 
 print(json.dumps(out))
 """
 
-# Text written into issues/comments since a point in time (kept for callers that only need text).
-RECENT_TEXT_SCRIPT = r"""
-import json, subprocess, sys
-since = int(sys.argv[1])
-sql = ("SELECT coalesce(json_agg(t), '[]') FROM ("
-       "SELECT 'issue' AS kind, id, coalesce(name, '') || E'\n' || coalesce(content, '') AS text "
-       "FROM issue WHERE updated_unix >= %d UNION ALL "
-       "SELECT 'comment', id, coalesce(content, '') FROM comment WHERE updated_unix >= %d) t") % (since, since)
-res = subprocess.run(["runuser", "-u", "postgres", "--", "psql", "-d", "gitea", "-At", "-c", sql],
-                     capture_output=True, text=True, timeout=60)
-print(res.stdout.strip() or "[]")
-"""
-
-# A Gitea API call made from inside the target, on 127.0.0.1:3000, with a given user's token
-# (control-plane fallback when the web front end rejects the org identity). stdin: JSON
-# {method, path, token, body}. Prints {status, body}.
-GUEST_API_SCRIPT = r"""
-import json, sys, urllib.error, urllib.request
+# A Gitea API call made from inside the target, straight to Gitea (GITEA_LOCAL), with a given
+# user's token (control-plane fallback when the web front end rejects the org identity).
+# stdin: JSON {method, path, token, body}. Prints {status, body, endpoint} — or {status: null,
+# error} when Gitea could not be reached at all.
+GUEST_API_SCRIPT = GITEA_LOCAL + r"""
+import json, sys
 req = json.load(sys.stdin)
 data = json.dumps(req["body"]).encode() if req.get("body") is not None else None
-r = urllib.request.Request("http://127.0.0.1:3000/api/v1" + req["path"], data=data, method=req["method"],
-                           headers={"Authorization": "token " + req["token"], "Content-Type": "application/json"})
+headers = {"Authorization": "token " + req["token"], "Content-Type": "application/json"}
 try:
-    with urllib.request.urlopen(r, timeout=30) as resp:
-        print(json.dumps({"status": resp.status, "body": resp.read().decode("utf-8", "replace")[:200000]}))
-except urllib.error.HTTPError as exc:
-    print(json.dumps({"status": exc.code, "body": exc.read().decode("utf-8", "replace")[:2000]}))
+    status, body, where = gitea_call(req["method"], "/api/v1" + req["path"], headers, data, timeout=30)
+    print(json.dumps({"status": status, "body": body.decode("utf-8", "replace")[:200000], "endpoint": where}))
+except Exception as exc:
+    print(json.dumps({"status": None, "error": ("%s: %s" % (type(exc).__name__, exc))[:300]}))
 """
 
 # Were the writes the service acknowledged to its users actually kept? Reads a JSON list of

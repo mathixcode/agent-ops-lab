@@ -16,7 +16,9 @@ Every fault declares, besides how it is injected:
                   opened or closed by probes
     precondition  must hold before injecting (the disk is not already above the threshold …);
                   otherwise the injection is skipped and recorded as applied: false
-    effect        after injecting: did the fault actually take hold? (applied: true/false)
+    effect        after injecting: did the fault actually take hold? (applied: true/false).
+                  Judged by polling (await_effect) for up to EFFECT_TIMEOUT_S: a slow guest
+                  (nginx still reloading, a restart still propagating) is not "not applied"
 
 Facts (the guest-agent cycle's "faults" part): disk_used_pct, postgres {ActiveState,
 MainPID, ActiveEnterTimestampMonotonic, …}, gitea {ActiveState, MemoryMax}, netem (bool),
@@ -25,6 +27,7 @@ served_cert {valid, detail}.
 from __future__ import annotations
 
 import secrets
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -127,12 +130,14 @@ def _eff_db_restart(before: Facts, after: Facts) -> Verdict:
 # ------------------------------------------------------------------ cert_expire
 def _inject_cert_expire(ctx: Context) -> dict:
     # `systemctl reload` returns before the new nginx workers serve the new file: wait (up to
-    # ~10 s) until the served certificate really is the expired one, so the effect check
-    # that follows the injection measures the fault and not the reload delay.
-    script = ("cat > /etc/ssl/lab/target.crt && systemctl reload nginx && for i in $(seq 20); do "
+    # 60 s — a loaded or emulated guest reloads slowly) until the served certificate really is
+    # the expired one. The effect check after the injection polls as well (await_effect).
+    script = ("cat > /etc/ssl/lab/target.crt && systemctl reload nginx && for i in $(seq 120); do "
               "openssl s_client -connect 127.0.0.1:443 -servername target.lab </dev/null 2>/dev/null "
               "| openssl x509 -noout -checkend 0 >/dev/null 2>&1 || exit 0; sleep 0.5; done; exit 0")
-    ctx.hv.guest_exec(["/bin/bash", "-c", script], stdin=ctx.expired_cert, timeout=60)
+    res = ctx.hv.guest_exec(["/bin/bash", "-c", script], stdin=ctx.expired_cert, timeout=90)
+    if res["exitcode"] != 0:
+        raise RuntimeError(f"fault injection failed ({res['exitcode']}): {res['stderr'][-400:]}")
     return {"action": "served certificate replaced by an expired one, nginx reloaded"}
 
 
@@ -161,23 +166,39 @@ def _inject_oom_worker(ctx: Context) -> dict:
     return {"action": "gitea.service MemoryMax=48M (runtime drop-in): the worker is OOM-killed on restart loop"}
 
 
+# A memory limit at or below this keeps Gitea from running normally (the fault sets 48M). A
+# limit above it — the operator raised it rather than removing it — ends the fault just as
+# removing it does; a sane limit set as hardening does not count as the fault being there.
+OOM_CEILING_BYTES = 256 * 1024 * 1024
+
+
 def _limit(f: Facts) -> str:
     return str((f.get("gitea") or {}).get("MemoryMax", "?"))
 
 
-def _det_oom_worker(f: Facts) -> Verdict:
-    """Open while the memory limit is in place — the cause, not Gitea's health (which other
-    faults can also take down)."""
+def _too_low(f: Facts) -> bool:
+    """Is a memory limit at or below OOM_CEILING_BYTES in place? Raises if the fact is missing
+    or unreadable (the detector then reports "unknown", never "closed")."""
     limit = _limit(f)
-    return limit not in ("infinity", "?"), f"MemoryMax={limit} state={(f.get('gitea') or {}).get('ActiveState')}"
+    if limit == "infinity":
+        return False
+    if not limit.isdigit():
+        raise ValueError(f"MemoryMax not readable: {limit!r}")
+    return int(limit) <= OOM_CEILING_BYTES
+
+
+def _det_oom_worker(f: Facts) -> Verdict:
+    """Open while a too-low memory limit is in place — the cause, not Gitea's health (which
+    other faults can also take down)."""
+    return _too_low(f), f"MemoryMax={_limit(f)} state={(f.get('gitea') or {}).get('ActiveState')}"
 
 
 def _pre_oom_worker(f: Facts) -> Verdict:
-    return _limit(f) == "infinity", f"MemoryMax={_limit(f)}"
+    return not _too_low(f), f"MemoryMax={_limit(f)}"
 
 
 def _eff_oom_worker(before: Facts, after: Facts) -> Verdict:
-    return _limit(after) not in ("infinity", "?"), f"MemoryMax {_limit(before)} -> {_limit(after)}"
+    return _too_low(after), f"MemoryMax {_limit(before)} -> {_limit(after)}"
 
 
 # ------------------------------------------------------------------ net_latency
@@ -225,6 +246,35 @@ FAULTS: dict[str, Fault] = {f.ref: f for f in (
 )}
 
 DEFAULT_TRANSIENT_WINDOW = 600
+EFFECT_TIMEOUT_S = 90.0         # how long a fault may take to show its effect before "not applied"
+EFFECT_POLL_S = 5.0
+
+
+def await_effect(fault: Fault, before: Facts, read_facts: Callable[[], Facts],
+                 timeout: float = EFFECT_TIMEOUT_S, interval: float = EFFECT_POLL_S,
+                 sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic,
+                 cancelled: Callable[[], bool] = lambda: False) -> tuple[bool | None, str, Facts | None]:
+    """Poll the fault's effect check until it holds or `timeout` passes (or the run stops).
+
+    -> (took, detail, last facts). took is None when no facts could be read at all (the
+    effect is unverified — the caller decides from whether the injection itself succeeded).
+    A failed read is retried like a negative answer: a busy guest agent is not a verdict."""
+    deadline = clock() + timeout
+    took, detail, after = None, "no facts could be read after the injection", None
+    while True:
+        try:
+            facts = read_facts()
+            ok, why = fault.effect(before, facts)
+            took, detail, after = ok, why, facts
+            if ok:
+                return took, detail, after
+        except Exception as exc:                    # unreadable this time: keep the last real answer
+            if took is None:
+                detail = f"could not read facts: {type(exc).__name__}: {exc}"[:300]
+        if clock() >= deadline or cancelled():
+            return took, detail, after
+        sleep(interval)
 
 
 def applied(payload: dict) -> bool:

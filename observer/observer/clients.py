@@ -26,6 +26,19 @@ class Unreachable(RuntimeError):
     pass
 
 
+def _json_or_error(resp: requests.Response, what: str) -> dict:
+    """A control API's JSON answer. Anything else (an HTML error page from a crashed handler,
+    an empty body) becomes a RuntimeError — the type every caller already handles — instead of
+    a JSONDecodeError escaping into the run loop or the teardown."""
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{what}: HTTP {resp.status_code}, not JSON: {resp.text[:200]!r}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{what}: HTTP {resp.status_code}, unexpected answer {str(data)[:200]!r}")
+    return data
+
+
 class Hypervisor:
     def __init__(self, cfg: Config) -> None:
         self.url = cfg.hv_url
@@ -38,7 +51,7 @@ class Hypervisor:
             resp = self.session.request(method, self.url + path, json=body, timeout=timeout)
         except requests.RequestException as exc:
             raise Unreachable(f"hypervisor {path}: {exc}") from exc
-        data = resp.json()
+        data = _json_or_error(resp, f"hypervisor {path}")
         if resp.status_code != 200:
             raise RuntimeError(f"hypervisor {path}: {data.get('error', resp.status_code)}")
         return data
@@ -55,7 +68,8 @@ class Hypervisor:
             if isinstance(stdin, str):
                 stdin = stdin.encode()
             body["stdin_b64"] = base64.b64encode(stdin).decode()
-        return self._call("POST", "/guest-exec", body, timeout=timeout + 30)
+        # The daemon polls until `timeout` and then kills the command in the guest; leave it room.
+        return self._call("POST", "/guest-exec", body, timeout=timeout + 60)
 
     def guest_sh(self, script: str, timeout: float = 60) -> dict:
         return self.guest_exec(["/bin/bash", "-c", script], timeout=timeout)
@@ -162,7 +176,7 @@ class DefenderAPI:
             resp = self.session.request(method, self.url + path, json=body, timeout=60)
         except requests.RequestException as exc:
             raise Unreachable(f"defender control {path}: {exc}") from exc
-        data = resp.json()
+        data = _json_or_error(resp, f"defender control {path}")
         if resp.status_code != 200:
             raise RuntimeError(f"defender control {path}: {data.get('error', resp.status_code)}")
         return data

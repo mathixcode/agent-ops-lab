@@ -145,20 +145,55 @@ class VM:
             return False
 
     def guest_exec(self, argv: list[str], stdin: bytes | None = None, timeout: float = 60) -> dict:
+        """Run a command in the guest and wait for it (at most `timeout` seconds).
+
+        A slow or garbled guest-agent reply while polling is retried until the deadline — one
+        slow poll on a busy guest is not a failed command. At the deadline the command and
+        everything it started are killed inside the guest, so timed-out commands never pile up
+        there. `truncated` says whether the guest agent cut the captured output short."""
         args = {"path": argv[0], "arg": argv[1:], "capture-output": True}
         if stdin is not None:
             args["input-data"] = base64.b64encode(stdin).decode()
-        pid = self._qga({"execute": "guest-exec", "arguments": args}, timeout=10)["pid"]
+        pid = self._qga({"execute": "guest-exec", "arguments": args}, timeout=15)["pid"]
         deadline = time.time() + timeout
         while True:
-            st = self._qga({"execute": "guest-exec-status", "arguments": {"pid": pid}}, timeout=10)
+            try:
+                st = self._qga({"execute": "guest-exec-status", "arguments": {"pid": pid}}, timeout=10)
+            except (OSError, ValueError) as exc:        # timeout, closed channel, garbled reply line
+                if time.time() > deadline:
+                    self._kill_guest(pid)
+                    raise TimeoutError(f"guest command {argv[0]}: no status within {timeout}s "
+                                       f"({type(exc).__name__}); killed") from exc
+                time.sleep(1)
+                continue
             if st.get("exited"):
                 return {"exitcode": st.get("exitcode", -1),
                         "stdout": base64.b64decode(st.get("out-data", "")).decode("utf-8", "replace"),
-                        "stderr": base64.b64decode(st.get("err-data", "")).decode("utf-8", "replace")}
+                        "stderr": base64.b64decode(st.get("err-data", "")).decode("utf-8", "replace"),
+                        "truncated": bool(st.get("out-truncated") or st.get("err-truncated"))}
             if time.time() > deadline:
-                raise TimeoutError(f"guest command still running after {timeout}s: {argv[0]}")
+                self._kill_guest(pid)
+                raise TimeoutError(f"guest command still running after {timeout}s: {argv[0]} (killed)")
             time.sleep(0.5)
+
+    # Kills a process and all its descendants, children first (argv: kill-tree <pid>).
+    KILL_TREE = ('kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; '
+                 'kill -KILL "$1" 2>/dev/null; }; kill_tree "$1"')
+
+    def _kill_guest(self, pid: int) -> None:
+        """Best effort: kill a timed-out guest command and what it started, then collect its
+        status so the guest agent forgets it."""
+        try:
+            killer = self._qga({"execute": "guest-exec", "arguments": {
+                "path": "/bin/bash", "arg": ["-c", self.KILL_TREE, "kill-tree", str(pid)]}}, timeout=10)["pid"]
+            for target in (killer, pid):
+                for _ in range(20):
+                    if self._qga({"execute": "guest-exec-status", "arguments": {"pid": target}},
+                                 timeout=10).get("exited"):
+                        break
+                    time.sleep(0.25)
+        except Exception as exc:
+            print(f"hvd: could not kill guest pid {pid}: {type(exc).__name__}: {exc}", flush=True)
 
     def status(self) -> dict:
         meta = {}

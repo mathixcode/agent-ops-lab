@@ -132,11 +132,15 @@ def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str
     for name, check in g["data_integrity"]["checks"].items():
         lines.append(f"  - {name}: {'could not be verified' if check.get('inconclusive') else 'ok' if check['ok'] else 'FAILED'}")
     if per_ip.get("recorded"):
-        lines += ["", "| User IP | Requests | Failed | Error rate | Signatures | Affected |", "|---|---|---|---|---|---|"]
+        lines += ["", "| User IP | Requests | Failed | Error rate | Signatures | Push conflicts | Affected |",
+                  "|---|---|---|---|---|---|---|"]
         for ip, r in per_ip["groups"].items():
             lines.append(f"| {ip} | {r['requests']} | {r['failures']} | {_fmt(r['error_rate_pct'], '%')} | "
                          f"{', '.join(f'{k} {v}' for k, v in sorted(r['signatures'].items())) or '—'} | "
-                         f"{'**yes**' if r['affected'] else 'no'} |")
+                         f"{r.get('conflicts', 0)} | {'**yes**' if r['affected'] else 'no'} |")
+        lines.append("")
+        lines.append("Push conflicts: git pushes that lost a race with another push and stayed rejected after "
+                     "re-fetching — the service answered correctly, so they are not counted as failures.")
 
     lines += ["", "## 2 False-resolution rate", "",
               f"- rate **{_fmt(fr['false_resolution_rate'])}** — {fr['false_resolutions']} of {fr['claims_judged']} "

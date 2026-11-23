@@ -33,26 +33,43 @@ log = logging.getLogger("observer.collect")
 JOURNAL_UNITS = ("gitea", "nginx", "postgresql", "ssh", "auditd", "chrony")
 HEALTH_UNITS = ("gitea", "nginx", "postgresql", "auditd", "ssh", "chrony")
 MAX_LOG_EVENTS = 400
+MAX_LINES_PER_PULL = 200_000        # per log file and pull; the rest is read on the next pull
+MAX_JOURNAL_PER_PULL = 4000
 
 # Runs on the target as the unprivileged observer account. Line-based cursors: only complete
-# lines are ever read, and a changed inode (rotation) restarts the cursor.
+# lines are ever read, and nothing is skipped:
+#   - at most MAX_LINES_PER_PULL lines per pull, and the cursor advances by exactly what was
+#     read (a backlog after an outage is drained over the next pulls, not dropped);
+#   - a changed inode means the file was rotated: the rest of the old file (still there as
+#     <file>.1 — logrotate's delaycompress, auditd's own rotation) is read first, then the new
+#     file from its start;
+#   - the journal is read oldest-first after the cursor (journalctl -n would keep the newest
+#     and skip the rest).
 TARGET_SCRIPT = r'''
-tail_new() {  # file saved_inode saved_lines [filter]
-    file=$1; saved_inode=$2; saved_lines=$3
+tail_new() {  # file saved_inode saved_lines max_lines
+    file=$1; saved_inode=$2; saved_lines=$3; max=$4
     inode=$(stat -c %%i "$file" 2>/dev/null) || { echo "@@CURSOR missing 0"; return; }
     total=$(wc -l < "$file")
-    if [ "$inode" != "$saved_inode" ] || [ "$total" -lt "$saved_lines" ]; then saved_lines=0; fi
-    echo "@@CURSOR $inode $total"
-    [ "$total" -gt "$saved_lines" ] && tail -n +$((saved_lines + 1)) "$file" | head -n $((total - saved_lines))
+    old=""
+    if [ -n "$saved_inode" ] && [ "$inode" != "$saved_inode" ] \
+            && [ "$(stat -c %%i "$file.1" 2>/dev/null)" = "$saved_inode" ]; then
+        old="$file.1"
+    fi
+    if [ "$inode" != "$saved_inode" ] || [ "$total" -lt "$saved_lines" ]; then start=0; else start=$saved_lines; fi
+    n=$((total - start)); [ "$n" -gt "$max" ] && n=$max
+    echo "@@CURSOR $inode $((start + n))"
+    [ -n "$old" ] && tail -n +$((saved_lines + 1)) "$old" | head -n "$max"
+    [ "$n" -gt 0 ] && tail -n +$((start + 1)) "$file" | head -n "$n"
+    return 0
 }
 echo "@@AUDIT"
-tail_new /var/log/audit/audit.log "%(audit_inode)s" %(audit_lines)d
+tail_new /var/log/audit/audit.log "%(audit_inode)s" %(audit_lines)d %(max_lines)d
 echo "@@NGINX"
-tail_new /var/log/nginx/access.log "%(nginx_inode)s" %(nginx_lines)d | head -n 200000
+tail_new /var/log/nginx/access.log "%(nginx_inode)s" %(nginx_lines)d %(max_lines)d
 echo "@@NGINXERR"
-tail_new /var/log/nginx/error.log "%(err_inode)s" %(err_lines)d | grep -E '^@@CURSOR|limiting (requests|connections)|access forbidden by rule|upstream|connect\(\) failed' | head -n 200000
+tail_new /var/log/nginx/error.log "%(err_inode)s" %(err_lines)d %(max_lines)d | grep -E '^@@CURSOR|limiting (requests|connections)|access forbidden by rule|upstream|connect\(\) failed'
 echo "@@JOURNAL"
-journalctl -o json --no-pager -n 4000 %(journal_from)s %(journal_units)s 2>/dev/null
+journalctl -o json --no-pager %(journal_from)s %(journal_units)s 2>/dev/null | head -n %(max_journal)d
 echo "@@HEALTH"
 systemctl is-active %(health_units)s | tr '\n' ' '; echo
 curl -s -o /dev/null -m 8 -w '%%{http_code}\n' http://127.0.0.1:3000/api/healthz
@@ -160,6 +177,7 @@ class TargetCollector:
             "audit_inode": self.cursor["audit_inode"], "audit_lines": self.cursor["audit_lines"],
             "nginx_inode": self.cursor["nginx_inode"], "nginx_lines": self.cursor["nginx_lines"],
             "err_inode": self.cursor["err_inode"], "err_lines": self.cursor["err_lines"],
+            "max_lines": MAX_LINES_PER_PULL, "max_journal": MAX_JOURNAL_PER_PULL,
             "journal_from": journal_from, "journal_units": " ".join(f"-u {u}" for u in JOURNAL_UNITS),
             "health_units": " ".join(HEALTH_UNITS)}
         _, out, _ = self.ssh.run("bash -s", stdin=script, timeout=120)
@@ -356,8 +374,11 @@ class LangfuseCollector:
                 "type": attr("lab.event.type"), "seq": int(attr("lab.event.seq")),
                 "payload": json.loads(payload) if isinstance(payload, str) else payload}
 
-    def pull(self) -> int:
-        since = self.high_water - dt.timedelta(minutes=5)       # ingestion into Langfuse is asynchronous
+    def pull(self, full: bool = False) -> int:
+        """New defender events. The rolling window reaches 5 minutes behind the newest event seen
+        (Langfuse ingests asynchronously); `full` reads from the run's start — the teardown does
+        that once, for spans that started long before they arrived (a long tool call)."""
+        since = self.run_start if full else self.high_water - dt.timedelta(minutes=5)
         n = 0
         for obs in self._observations(since):
             try:

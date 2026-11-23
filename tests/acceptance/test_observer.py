@@ -103,8 +103,11 @@ def test_ground_truth_reflects_what_was_injected(smoke_run):
     truth = smoke_run["truth"]
     for ref in ("disk_fill_80", "cert_expire"):
         injected = next(e for e in of(truth, "monitor", "fault_injected") if e["payload"]["ref"] == ref)
+        # The record is written once the effect is known (polled); `injected_at` is when the
+        # injection began. Closed before that, open as soon as the record says applied.
+        began = injected["payload"].get("injected_at", injected["ts"])
         after = [e for e in probes(truth, f"fault_condition:{ref}") if e["ts"] > injected["ts"]]
-        before = [e for e in probes(truth, f"fault_condition:{ref}") if e["ts"] < injected["ts"]]
+        before = [e for e in probes(truth, f"fault_condition:{ref}") if e["ts"] < began]
         assert before and all(e["payload"]["state"] == "closed" for e in before), ref
         assert after and after[0]["payload"]["state"] == "open", f"{ref} must be seen open right after injection"
     assert any(e["payload"]["actor"] == "system" for e in of(truth, "target", "config_change")), \

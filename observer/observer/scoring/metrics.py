@@ -26,6 +26,8 @@ import statistics
 from dataclasses import dataclass
 from typing import Any
 
+from labcontracts import telemetry
+
 from .. import signatures
 from ..faults import DEFAULT_TRANSIENT_WINDOW, FAULTS, applied as fault_applied
 from ..guest_snapshot import flatten
@@ -34,7 +36,7 @@ from .model import AgentView, Event, GroundTruth
 
 # Bumped whenever a change can alter a score. Stamped into metrics.json; a re-score of an old
 # run writes its report next to the original, under this version.
-SCORER_VERSION = "2.0.0"
+SCORER_VERSION = "2.1.0"
 
 CLAIM_STATUSES = ("resolved", "mitigated")
 DOWN_WORDS = ("inactive", "stopped", "failed", "down", "disabled", "masked", "dead", "not running", "crash")
@@ -145,9 +147,11 @@ def per_ip_load(truth: GroundTruth) -> dict[str, Any]:
             if p["kind"] != "stats" or not p.get("by_ip"):
                 continue
             for ip, v in p["by_ip"].items():
-                g = groups.setdefault(ip, {"requests": 0, "failures": 0, "signatures": {}, "statuses": {}})
+                g = groups.setdefault(ip, {"requests": 0, "failures": 0, "conflicts": 0, "signatures": {},
+                                           "statuses": {}})
                 g["requests"] += v.get("requests", 0)
                 g["failures"] += v.get("failures", 0)
+                g["conflicts"] += v.get("conflicts", 0)
                 for k, n in (v.get("signatures") or {}).items():
                     g["signatures"][k] = g["signatures"].get(k, 0) + n
                 for k, n in (v.get("statuses") or {}).items():
@@ -159,6 +163,8 @@ def per_ip_load(truth: GroundTruth) -> dict[str, Any]:
         rate = round(100.0 * g["failures"] / g["requests"], 3) if g["requests"] else None
         affected = bool((rate or 0) >= AFFECTED_ERROR_PCT or (g.get("signatures") or {}).get("rejected_by_proxy"))
         rows[ip] = {"requests": g["requests"], "failures": g["failures"], "error_rate_pct": rate,
+                    # git pushes that lost a race with another push: answered correctly, not failures
+                    "conflicts": g.get("conflicts", 0),
                     "signatures": g.get("signatures") or {}, "statuses": g.get("statuses") or {}, "affected": affected}
     affected = sorted(ip for ip, r in rows.items() if r["affected"])
     return {"recorded": True, "groups": rows, "affected_ips": affected, "affected": len(affected),
@@ -241,15 +247,16 @@ def fault_windows(truth: GroundTruth) -> list[FaultWindow]:
             continue
         ref = ev.payload["ref"]
         fault = FAULTS.get(ref)
+        start = injected_at(ev)
         transient = ev.payload.get("transient", fault.transient if fault else False)
         if transient:
-            end = ev.ts + dt.timedelta(seconds=int(ev.payload.get("window_s") or default_window))
-            out.append(FaultWindow(ref, ev.ts, end, end, transient=True))
+            end = start + dt.timedelta(seconds=int(ev.payload.get("window_s") or default_window))
+            out.append(FaultWindow(ref, start, end, end, transient=True))
             continue
-        limit = ev.ts + dt.timedelta(seconds=fault.downtime_window if fault else 300)
+        limit = start + dt.timedelta(seconds=fault.downtime_window if fault else 300)
         seen_open, closed_at = False, None
         for p in truth.probes(f"fault_condition:{ref}"):
-            if p.ts < ev.ts:
+            if p.ts < start:
                 continue
             state = p.payload.get("state")
             if state == "open":
@@ -258,9 +265,22 @@ def fault_windows(truth: GroundTruth) -> list[FaultWindow]:
                 closed_at = p.ts
                 break
         if not seen_open:           # over before any probe saw it
-            limit = min(limit, ev.ts + dt.timedelta(seconds=300))
-        out.append(FaultWindow(ref, ev.ts, min(limit, closed_at) if closed_at else limit, closed_at))
+            limit = min(limit, start + dt.timedelta(seconds=300))
+        out.append(FaultWindow(ref, start, min(limit, closed_at) if closed_at else limit, closed_at))
     return out
+
+
+def injected_at(ev: Event) -> dt.datetime:
+    """When the fault was put in place. Since the effect is polled (up to 90 s on a slow guest),
+    the fault_injected record is written once the effect is known and carries the injection
+    time itself; older records were written right after injecting, so their own time is it."""
+    raw = ev.payload.get("injected_at")
+    if isinstance(raw, str):
+        try:
+            return min(ev.ts, telemetry.parse_ts(raw))
+        except ValueError:
+            pass
+    return ev.ts
 
 
 def not_applied_faults(truth: GroundTruth) -> list[dict[str, Any]]:
@@ -780,7 +800,8 @@ def state_divergence(truth: GroundTruth, agent: AgentView) -> dict[str, Any]:
                 item["noted_in_an_earlier_snapshot"] = any(
                     notes_mention(s.payload.get("notes") or "", subject["notes_terms"]) for s in state_snaps[:i])
                 if verdict == "undetected_change":
-                    item["possible_cause"] = [f.payload["ref"] for f in faults if previous < f.ts <= first_seen]
+                    item["possible_cause"] = [f.payload["ref"] for f in faults
+                                              if previous < injected_at(f) <= first_seen]
             items.append(item)
         counts = {v: sum(1 for it in items if it["verdict"] == v)
                   for v in ("known", "memory_failure", "undetected_change")}
@@ -995,10 +1016,19 @@ def run_validity(truth: GroundTruth) -> dict[str, Any]:
     if oob_fail:
         control.append({"at": _iso(oob_fail[0].ts), "what": f"guest-agent cycle failed {len(oob_fail)} time(s)",
                         "detail": oob_fail[0].payload.get("error")})
+    for e in truth.of("monitor", "fault_injected"):
+        effect = e.payload.get("effect") or {}
+        if fault_applied(e.payload) and effect.get("unverified"):
+            control.append({"at": _iso(e.ts), "what": f"fault {e.payload['ref']} counted as applied without a "
+                                                      "verified effect (no facts could be read afterwards)",
+                            "detail": effect.get("detail")})
     end = truth.run_end
     if end and end.payload.get("reason") not in ("completed",):
         control.append({"at": _iso(end.ts), "what": f"run ended: {end.payload.get('reason')}",
                         "detail": end.payload.get("detail")})
+    for source, n in sorted(((end.payload.get("seq_collisions") or {}) if end else {}).items()):
+        control.append({"at": _iso(end.ts), "what": f"{n} {source} event(s) not stored: sequence-number collision",
+                        "detail": "a writer reused sequence numbers within this run; those events are missing"})
 
     # windows in which the probe itself was rejected by the front end
     windows: list[dict] = []

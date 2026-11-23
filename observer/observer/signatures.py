@@ -10,7 +10,10 @@ Every failed availability probe and every failed load-generator request is class
     network_error       reset, unreachable, aborted without an answer
 
 plus `app_rejected` for a 4xx that Gitea itself sent (an application answer, e.g. 404/401) —
-not an availability failure of the front end, but recorded so nothing is silently dropped.
+not an availability failure of the front end, but recorded so nothing is silently dropped —
+and `conflict` for a git push rejected as non-fast-forward because another push landed first:
+the service worked; the load generator fetches and pushes again, and a push that keeps losing
+the race is counted as a conflict, never as a failure.
 
 Which component answered is decided from the response itself: nginx's default error page
 ("<center>nginx</center>") versus Gitea's markers (its cookies `i_like_gitea`/`_csrf`, its JSON
@@ -26,7 +29,7 @@ import re
 from typing import Any, Mapping
 
 SIGNATURES = ("rejected_by_proxy", "upstream_down", "app_error", "tls_error", "timeout", "network_error")
-EXTRA = ("app_rejected",)
+EXTRA = ("app_rejected", "conflict")       # conflict: a git push that lost a race (never a failure)
 
 # When one probe saw several failures (health endpoint and API), the one closest to the service
 # itself wins: a front end that rejects a client says nothing about whether the service is up.
@@ -102,10 +105,21 @@ def classify_exception(exc: BaseException) -> tuple[str, str]:
 
 
 _GIT_STATUS = re.compile(r"returned error: (\d{3})")
+# `! [rejected] HEAD -> main (fetch first)` / `(non-fast-forward)`: the push lost a race with
+# another push. Gitea answered correctly — nothing failed; the pusher fetches and tries again.
+_GIT_CONFLICT = re.compile(r"\[rejected\][^\n]*\((?:fetch first|non-fast-forward)\)")
+# `! [remote rejected] HEAD -> main (protected branch …)`: the server itself refused the push.
+_GIT_REMOTE_REJECTED = re.compile(r"\[remote rejected\]")
 
 
 def classify_git_error(stderr: str) -> str:
-    """Signature of a failed `git` over HTTPS, from its stderr."""
+    """Signature of a failed `git` over HTTPS, from its stderr. "conflict" (not an availability
+    failure, see EXTRA) for a non-fast-forward rejection; "app_rejected" when Gitea refused the
+    push (a protected branch, a hook)."""
+    if _GIT_CONFLICT.search(stderr):
+        return "conflict"
+    if _GIT_REMOTE_REJECTED.search(stderr):
+        return "app_rejected"
     m = _GIT_STATUS.search(stderr)
     if m:
         return signature_of_status(int(m.group(1)))

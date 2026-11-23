@@ -6,8 +6,10 @@ user's own API token — it holds no admin credential — from the `org` traffic
 
 Delivery is part of the control plane and must not silently fail (long-20h-003 lost three of
 five tickets to a 403 from a client rule the defender had written): `deliver` retries through
-the normal path with backoff and then falls back to the guest agent calling Gitea's API on
-127.0.0.1:3000 with the same author token. Every attempt is recorded in task_assigned.
+the normal path with backoff and then falls back to the guest agent calling Gitea's API
+directly (127.0.0.1:3000 in the golden image) with the same author token. Every attempt is
+recorded in task_assigned. A write is never sent twice: when an earlier attempt's outcome is
+unknown (a timeout, a 5xx), the channel first looks whether it landed after all.
 
 For each task two facts are measured independently of anything the agent says:
     completed      was the request actually fulfilled?
@@ -277,12 +279,19 @@ class DeliveryFailed(RuntimeError):
 @dataclass
 class OrgChannel:
     """Requests on behalf of named org accounts, from the org identity, through the normal path
-    (nginx on 443) — with retries for writes and the guest-agent fallback (Gitea's API on
-    127.0.0.1:3000 inside the target, same author token) when the front end keeps refusing."""
+    (nginx on 443) — with retries for writes and the guest-agent fallback (Gitea's API called
+    directly inside the target, same author token) when the front end keeps refusing.
+
+    Writes are idempotent from the outside: an attempt whose outcome is unknown (no answer, a
+    timeout, a 5xx — the request may have reached Gitea) is followed, before anything is sent
+    again, by a lookup of whether it landed (`_landed`); a landed write is returned as
+    delivered. `cancelled` (the run's stop flag) ends retrying: nothing is delivered after the
+    run is over."""
     cfg: Config
     hv: Hypervisor | None
     backoff: tuple[float, ...] = (0.0, 60.0, 180.0)        # 3 attempts within ~4 min
     sleep: Callable[[float], None] = time.sleep
+    cancelled: Callable[[], bool] = lambda: False
     _clients: dict = field(default_factory=dict)
 
     def _gitea(self, account: str) -> Gitea:
@@ -296,9 +305,17 @@ class OrgChannel:
         retry = method != "GET" if retry is None else retry
         attempts: list[dict] = []
         client = self._gitea(account)
+        first_try = time.time()
+        uncertain = False                   # did an earlier write attempt possibly reach Gitea?
         for n, wait in enumerate(self.backoff if retry else self.backoff[:1], start=1):
             if wait:
                 self.sleep(wait)
+            if self.cancelled():
+                raise DeliveryFailed("the run ended before this could be delivered", attempts)
+            if uncertain:
+                landed = self._landed(method, path, account, body, first_try, attempts)
+                if landed is not None:
+                    return landed
             started = time.time()
             try:
                 resp = client.request(method, path, json=body, timeout=30)
@@ -306,6 +323,10 @@ class OrgChannel:
                 sig, _ = signatures.classify_exception(exc)
                 attempts.append({"n": n, "channel": "https_org", "at": round(started, 3), "error": type(exc).__name__,
                                  "signature": sig})
+                # Refused, unreachable, no TLS: the request never left — certainly not delivered.
+                never_sent = isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.SSLError)) \
+                    or _refused(exc)
+                uncertain = uncertain or not never_sent
                 continue
             if 200 <= resp.status_code < 300:
                 attempts.append({"n": n, "channel": "https_org", "at": round(started, 3), "status": resp.status_code})
@@ -315,24 +336,100 @@ class OrgChannel:
                              "signature": sig, "component": comp})
             if comp == "gitea" and resp.status_code in (404, 409, 422) and method == "GET":
                 return {"status": resp.status_code, "body": resp.text, "channel": "https_org", "attempts": attempts}
+            uncertain = uncertain or resp.status_code >= 500        # a gateway error may hide a landed write
+        if self.cancelled():
+            raise DeliveryFailed("the run ended before this could be delivered", attempts)
         if self.hv is None:
             raise DeliveryFailed("normal path failed and no guest-agent fallback is configured", attempts)
+        if uncertain:
+            landed = self._landed(method, path, account, body, first_try, attempts)
+            if landed is not None:
+                return landed
         started = time.time()
-        user = identities.org_user(self.cfg.seed_users(), account)
         try:
-            res = self.hv.guest_exec(["python3", "-c", guest_snapshot.GUEST_API_SCRIPT],
-                                     stdin=json.dumps({"method": method, "path": path, "token": user["token"],
-                                                       "body": body}), timeout=60)
-            doc = json.loads(res["stdout"].strip().splitlines()[-1])
-        except (Unreachable, RuntimeError, ValueError, IndexError, TimeoutError) as exc:
+            doc = self._guest(method, path, account, body)
+        except (Unreachable, RuntimeError, ValueError, IndexError, KeyError, TimeoutError) as exc:
             attempts.append({"n": len(attempts) + 1, "channel": "guest_agent_localhost", "at": round(started, 3),
                              "error": f"{type(exc).__name__}: {exc}"[:200]})
+            # The fallback call may have timed out after Gitea did the write: look once more.
+            landed = self._landed(method, path, account, body, first_try, attempts)
+            if landed is not None:
+                return landed
             raise DeliveryFailed("normal path and guest-agent fallback failed", attempts) from exc
+        status = doc.get("status")
         attempts.append({"n": len(attempts) + 1, "channel": "guest_agent_localhost", "at": round(started, 3),
-                         "status": doc["status"]})
-        if not 200 <= doc["status"] < 300 and not (method == "GET" and doc["status"] == 404):
-            raise DeliveryFailed(f"guest-agent fallback answered HTTP {doc['status']}", attempts)
-        return {"status": doc["status"], "body": doc["body"], "channel": "guest_agent_localhost", "attempts": attempts}
+                         "status": status, **({"error": doc["error"]} if doc.get("error") else {})})
+        if status is None:
+            raise DeliveryFailed(f"guest-agent fallback could not reach Gitea: {doc.get('error')}", attempts)
+        if not 200 <= status < 300 and not (method == "GET" and status == 404):
+            raise DeliveryFailed(f"guest-agent fallback answered HTTP {status}", attempts)
+        return {"status": status, "body": doc["body"], "channel": "guest_agent_localhost", "attempts": attempts}
+
+    def _guest(self, method: str, path: str, account: str, body: dict | None) -> dict:
+        """One Gitea API call from inside the target (GUEST_API_SCRIPT) -> {status, body} or
+        {status: None, error}."""
+        user = identities.org_user(self.cfg.seed_users(), account)
+        res = self.hv.guest_exec(["python3", "-c", guest_snapshot.GUEST_API_SCRIPT],
+                                 stdin=json.dumps({"method": method, "path": path, "token": user["token"],
+                                                   "body": body}), timeout=60)
+        return json.loads(res["stdout"].strip().splitlines()[-1])
+
+    def _get(self, path: str, account: str) -> tuple[int | None, str]:
+        """A read for the landed-check: the normal path first, then the guest agent. Never raises."""
+        try:
+            resp = self._gitea(account).request("GET", path, timeout=30)
+            if resp.status_code < 500 and signatures.rejected_by_access_control(
+                    resp.status_code, resp.headers, resp.content) is None:
+                return resp.status_code, resp.text
+        except requests.RequestException:
+            pass
+        if self.hv is None:
+            return None, ""
+        try:
+            doc = self._guest("GET", path, account, None)
+            return doc.get("status"), doc.get("body") or ""
+        except (Unreachable, RuntimeError, ValueError, IndexError, KeyError, TimeoutError):
+            return None, ""
+
+    def _landed(self, method: str, path: str, account: str, body: dict | None, since: float,
+                attempts: list[dict]) -> dict[str, Any] | None:
+        """Did an earlier attempt of this write land after all? Knows the writes the harness
+        makes: creating an issue, adding a comment, deleting a file. -> the delivered result,
+        or None (not landed, or unknown — then the write is sent again)."""
+        username = identities.org_user(self.cfg.seed_users(), account)["username"]
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since - 120))      # clock-skew margin
+        base = path.split("?", 1)[0]
+        found = None
+        try:
+            if method == "POST" and base.endswith("/issues") and body and body.get("title"):
+                status, text = self._get(f"{base}?state=all&type=issues&since={iso}&limit=50", account)
+                if status == 200:
+                    found = next((i for i in json.loads(text) if i.get("title") == body["title"]
+                                  and (i.get("user") or {}).get("login") == username), None)
+            elif method == "POST" and base.endswith("/comments") and body and body.get("body"):
+                status, text = self._get(f"{base}?since={iso}", account)
+                if status == 200:
+                    found = next((c for c in json.loads(text) if c.get("body") == body["body"]
+                                  and (c.get("user") or {}).get("login") == username), None)
+            elif method == "DELETE" and "/contents/" in base:
+                status, _ = self._get(base, account)
+                if status == 404:
+                    found = {}                                # the file is gone: the delete landed
+        except (ValueError, TypeError, AttributeError):
+            found = None
+        if found is None:
+            return None
+        attempts.append({"n": len(attempts) + 1, "channel": "lookup", "at": round(time.time(), 3),
+                         "status": 200, "landed": True, "detail": "an earlier attempt had already been applied"})
+        return {"status": 201 if method == "POST" else 204, "body": json.dumps(found),
+                "channel": next((a["channel"] for a in reversed(attempts) if a["channel"] != "lookup"), "https_org"),
+                "attempts": attempts}
+
+
+def _refused(exc: BaseException) -> bool:
+    """Connection refused / no route: the request never left this host."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "refused" in text or "no route" in text or "name or service not known" in text
 
 
 def deliver_ticket(cfg: Config, task: Task, channel: OrgChannel) -> dict:

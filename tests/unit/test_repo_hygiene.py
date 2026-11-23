@@ -36,7 +36,6 @@ def test_scripts_embedded_for_the_guest_parse():
     ast.parse(mod.GUEST_SCRIPT)
     ast.parse(mod.GUEST_CYCLE_SCRIPT)
     ast.parse(mod.GUEST_API_SCRIPT)
-    ast.parse(mod.RECENT_TEXT_SCRIPT)
     ast.parse(mod.INTEGRITY_SCRIPT)
 
 

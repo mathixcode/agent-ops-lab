@@ -13,11 +13,36 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 
 from labcontracts import manifest as mf
 
 from .config import Config
+
+
+def take_run_lock(cfg: Config, what: str):
+    """One run — or target reset — at a time on this lab: both drive the same target VM.
+
+    An exclusive flock held for the life of this process. The kernel releases it however the
+    process ends (crash, kill -9), so a dead run never blocks the next one. -> (handle, None)
+    when taken, (None, "who holds it") when another run is in progress."""
+    import fcntl
+    path = cfg.data / "runs" / ".lab-run.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.seek(0)
+        holder = fh.read().strip() or "unknown"
+        fh.close()
+        return None, holder
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"pid {os.getpid()}: {what}\n")
+    fh.flush()
+    return fh, None
 
 
 def main() -> int:
@@ -41,6 +66,11 @@ def main() -> int:
     if args.command == "run":
         from .orchestrator import Orchestrator
         manifest = mf.load_manifest(args.manifest)
+        lock, holder = take_run_lock(cfg, f"run {manifest.run_id}")
+        if lock is None:
+            print(f"lab-observer: another run or target reset is in progress ({holder}); "
+                  "wait for it to finish (labctl.py status)", file=sys.stderr)
+            return 3
         run_dir = cfg.run_dir(manifest.run_id)
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
                             handlers=[logging.StreamHandler(), logging.FileHandler(run_dir / "orchestrator.log")])
@@ -75,6 +105,11 @@ def main() -> int:
 
     if args.command == "reset-target":
         from .orchestrator import Orchestrator
+        lock, holder = take_run_lock(cfg, "target reset")
+        if lock is None:
+            print(f"lab-observer: a run is in progress ({holder}); not resetting the target under it",
+                  file=sys.stderr)
+            return 3
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
         manifest = mf.RunManifest("manual-reset", 0, "none", 1, "idle", 1)
         orch = Orchestrator.__new__(Orchestrator)

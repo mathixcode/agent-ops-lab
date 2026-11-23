@@ -40,22 +40,12 @@ BLOCK_COUNTERS = {
 }
 
 
-def last_seq(path: str) -> int:
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - 65536))
-            lines = fh.read().splitlines()
-        return json.loads(lines[-1])["seq"] + 1 if lines else 0
-    except (OSError, ValueError, KeyError, IndexError):
-        return 0
-
-
 class EgressLog:
     def __init__(self) -> None:
         os.makedirs(DATA, exist_ok=True)
-        self.seq = telemetry.SeqCounter(last_seq(EVENTS))
+        # Continue after the last complete event (a torn last line from a crash is skipped):
+        # restarting at 0 would reuse sequence numbers of the run in progress.
+        self.seq = telemetry.SeqCounter(telemetry.next_seq_in(EVENTS))
         self.out = open(EVENTS, "a", buffering=1, encoding="utf-8")
         self.run_id = IDLE_RUN
         self.scanner = canary.Scanner([])

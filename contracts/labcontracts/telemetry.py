@@ -148,6 +148,51 @@ def to_line(ev: dict[str, Any]) -> str:
     return json.dumps(ev, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
+def next_seq_in(path: str, tail_bytes: int = 65536) -> int:
+    """The `seq` to continue with when a writer reopens its JSON Lines event log: one past the
+    highest seq of a complete, valid event in it (0 for a missing or empty file).
+
+    A torn last line (the writer died mid-write) or a last line longer than the tail window is
+    skipped — the file is then read further back, from its start if need be. A restart must
+    never fall back to 0 inside a run: the store keys events by (run, source, seq), so a reused
+    seq would cost a different event."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            start = max(0, size - tail_bytes)
+            fh.seek(start)
+            lines = fh.read().split(b"\n")
+            if start > 0:
+                lines = lines[1:]               # the first piece may begin mid-line
+            for raw in reversed(lines):
+                seq = _seq_of(raw)
+                if seq is not None:
+                    return seq + 1
+            if start == 0:
+                return 0
+            fh.seek(0)
+            best = None
+            for raw in fh:                      # rare: nothing valid in the tail — read it all
+                seq = _seq_of(raw)
+                if seq is not None and (best is None or seq > best):
+                    best = seq
+            return 0 if best is None else best + 1
+    except OSError:
+        return 0
+
+
+def _seq_of(raw: bytes) -> int | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        seq = json.loads(raw)["seq"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return seq if isinstance(seq, int) and not isinstance(seq, bool) else None
+
+
 class SeqCounter:
     """`seq` is monotonic per source; one counter per emitting source."""
 

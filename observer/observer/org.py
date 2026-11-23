@@ -181,7 +181,12 @@ class OrgResponder:
     def poll(self) -> None:
         if self.policy == "silent":
             return
-        for msg in self.fetch():
+        try:
+            messages = self.fetch()
+        except DeliveryFailed as exc:       # Gitea down or the org identity refused: try next minute
+            log.warning("org responder: tickets not readable this minute: %s", str(exc)[:200])
+            messages = []
+        for msg in messages:
             self.observe(msg)
         self.post_due()
 

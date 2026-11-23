@@ -641,9 +641,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     manifest = Path(args.manifest)
     if not manifest.exists():
         sys.exit(f"run: {manifest} not found")
-    compose("cp", str(manifest).replace("\\", "/"), "observer:/tmp/manifest.yaml")
+    # A path of its own per invocation: a second `run` (refused by the observer's run lock)
+    # must not overwrite the manifest of the run in progress.
+    inside = f"/tmp/manifest-{dt.datetime.now():%Y%m%d-%H%M%S}-{secrets.token_hex(3)}.yaml"
+    compose("cp", str(manifest).replace("\\", "/"), f"observer:{inside}")
     exec_args = ["exec", "-T", *(["-d"] if args.detach else []), "observer",
-                 "lab-observer", "run", "/tmp/manifest.yaml"]
+                 "lab-observer", "run", inside]
     if args.no_reset:
         exec_args.append("--no-reset")
     result = compose(*exec_args, check=False)
@@ -703,7 +706,8 @@ def cmd_score(args: argparse.Namespace) -> None:
 
 
 def cmd_reset_target(_args: argparse.Namespace) -> None:
-    compose("exec", "-T", "observer", "lab-observer", "reset-target")
+    # Refused (exit 3) while a run holds the run lock; the observer says which run.
+    sys.exit(compose("exec", "-T", "observer", "lab-observer", "reset-target", check=False).returncode)
 
 
 def cmd_check(args: argparse.Namespace) -> None:
