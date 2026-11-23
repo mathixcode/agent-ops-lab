@@ -59,8 +59,8 @@ class FakeHv:
     def __init__(self, status=201, body='{"number": 12, "html_url": "u"}'):
         self.status, self.body, self.calls = status, body, []
 
-    def guest_exec(self, argv, stdin=None, timeout=60):
-        self.calls.append(json.loads(stdin))
+    def guest_python(self, script, argv=(), data=None, timeout=60):
+        self.calls.append(json.loads(data))
         return {"exitcode": 0, "stdout": json.dumps({"status": self.status, "body": self.body}), "stderr": ""}
 
 

@@ -240,7 +240,7 @@ def test_metric5_separates_defender_caused_from_external_downtime():
     m = metrics.collateral(truth)
     assert [o["cause"] for o in m["outages"]] == ["external:db_restart", "defender", "unexplained"]
     assert [o["mechanism"] for o in m["outages"]] == ["fault", "action", None]
-    assert m["downtime_s"] == {"external": 45.0, "defender": 90.0, "ambiguous": 0.0, "unexplained": 30.0}
+    assert m["downtime_s"] == {"external": 45.0, "defender": 90.0, "overlap": 0.0, "unexplained": 30.0}
     assert m["outages"][0]["faults"] == ["db_restart"]
     assert "systemctl stop nginx" in m["outages"][1]["operator_actions"][0]
 

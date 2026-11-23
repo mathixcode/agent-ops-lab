@@ -258,4 +258,4 @@ class SdkDriver:
 
     def status(self) -> dict[str, Any]:
         return {"driver": self.name, "model": self.model, "agent_turns": self.turns, "auth": self.meter.auth,
-                "session_id": self.session_id, "last_error": self.last_error}
+                "session_id": self.session_id, "tick_seconds": self.tick_seconds, "last_error": self.last_error}

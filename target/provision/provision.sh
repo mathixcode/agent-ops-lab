@@ -170,6 +170,10 @@ no_proxy=localhost,127.0.0.1,$TARGET_HOSTNAME,$LAB_TARGET_IP
 NO_PROXY=localhost,127.0.0.1,$TARGET_HOSTNAME,$LAB_TARGET_IP
 EOF
 echo "Acquire::http::Proxy \"$PROXY\"; Acquire::https::Proxy \"$PROXY\";" > /etc/apt/apt.conf.d/90lab-proxy
+# qemu-ga logs every guest-exec call (its full argv) and every status poll at INFO through
+# syslog. Only notice and above reach the journal, so the observer's channel stays out of it.
+mkdir -p /etc/systemd/system/qemu-guest-agent.service.d
+printf '[Service]\nLogLevelMax=notice\n' > /etc/systemd/system/qemu-guest-agent.service.d/10-loglevel.conf
 systemctl enable qemu-guest-agent 2>/dev/null || true
 
 log "account ids and versions"

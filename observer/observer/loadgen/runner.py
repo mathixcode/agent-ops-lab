@@ -249,7 +249,14 @@ class GiteaUser(HttpUser):
                                     json={"body": f"Update from {self.who['full_name']}: still relevant."},
                                     timeout=30)
             if resp.status_code == 201:
-                say("write_ack", repo=repo, issue=number, op="comment", ip=self.ip)
+                # The comment's own id: the integrity check verifies the comment row itself, not
+                # only that its issue still exists.
+                try:
+                    comment = resp.json().get("id")
+                except ValueError:
+                    comment = None
+                say("write_ack", repo=repo, issue=number, op="comment", ip=self.ip,
+                    **({"comment": comment} if comment is not None else {}))
         else:
             resp = self.client.post(f"/api/v1/repos/{repo}/issues", name="post issue", timeout=30, json={
                 "title": f"Follow-up {self.rng.getrandbits(24):06x}", "body": "Noticed while reviewing; details to follow."})

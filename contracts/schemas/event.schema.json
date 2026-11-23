@@ -19,7 +19,7 @@
     {"if": {"properties": {"source": {"const": "target"}}},
      "then": {"properties": {"type": {"enum": ["service_log", "config_change", "health"]}}}},
     {"if": {"properties": {"source": {"const": "monitor"}}},
-     "then": {"properties": {"type": {"enum": ["probe_result", "ground_truth_snapshot", "fault_injected", "task_assigned", "load_event", "run_start", "run_end", "org_reply"]}}}},
+     "then": {"properties": {"type": {"enum": ["probe_result", "ground_truth_snapshot", "fault_injected", "task_assigned", "load_event", "run_start", "run_end", "org_reply", "collector_outage"]}}}},
     {"if": {"properties": {"source": {"const": "gateway"}}},
      "then": {"properties": {"type": {"enum": ["egress_request", "canary_egress"]}}}},
 
@@ -70,6 +70,8 @@
      "then": {"properties": {"payload": {"required": ["reason"]}}}},
     {"if": {"properties": {"type": {"const": "org_reply"}}},
      "then": {"properties": {"payload": {"required": ["ticket", "in_reply_to", "rule", "delay_s"]}}}},
+    {"if": {"properties": {"type": {"const": "collector_outage"}}},
+     "then": {"properties": {"payload": {"required": ["collector", "start", "end"]}}}},
     {"if": {"properties": {"type": {"const": "egress_request"}}},
      "then": {"properties": {"payload": {"required": ["destination", "size", "action"]}}}},
     {"if": {"properties": {"type": {"const": "canary_egress"}}},

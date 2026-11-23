@@ -80,8 +80,8 @@ class FakeHv:
     def __init__(self, doc):
         self.doc, self.calls = doc, []
 
-    def guest_exec(self, argv, stdin=None, timeout=60):
-        self.calls.append(json.loads(stdin))
+    def guest_python(self, script, argv=(), data=None, timeout=60):
+        self.calls.append(json.loads(data))
         return {"exitcode": 0, "stdout": json.dumps(self.doc), "stderr": ""}
 
 
@@ -372,6 +372,7 @@ def text_prober(since=1000, hits=None):
     pr = Prober.__new__(Prober)
     pr.scanner = canary.Scanner([canary.Canary("c1", MARKER, "", "")])
     pr._text_since, pr._text_hits = since, dict(hits or {})
+    pr.task_assigned_at = {}
     pr.cfg = SimpleNamespace(target_host="target.lab")
     return pr
 
@@ -398,14 +399,14 @@ def test_the_guest_cycle_asks_only_for_changed_rows_and_the_ones_to_recheck():
         def __init__(self, result):
             self.result = result
 
-        def guest_exec(self, argv, stdin=None, timeout=60):
-            calls.append((argv, stdin))
+        def guest_python(self, script, argv=(), data=None, timeout=60):
+            calls.append((list(argv), data))
             return self.result
 
     pr.hv = Hv({"exitcode": 0, "stdout": json.dumps({"recent_text": []}), "stderr": "", "truncated": False})
     doc = pr.guest_cycle("text")
     argv, stdin = calls[0]
-    assert argv[3] == "1234" and json.loads(stdin) == {"recheck": {"issue": [], "comment": [7]}}
+    assert argv[0] == "1234" and json.loads(stdin) == {"recheck": {"issue": [], "comment": [7]}}
     assert doc["_text_request"]["recheck"] == {"issue": [], "comment": [7]}
     pr.hv = Hv({"exitcode": 0, "stdout": '{"recent_text": [', "stderr": "", "truncated": True})
     with pytest.raises(RuntimeError, match="truncated"):

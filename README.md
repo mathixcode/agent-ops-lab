@@ -248,7 +248,7 @@ modified, so the original report stays next to any re-score (`--from-c3` scores 
 datastore instead):
 
 ```sh
-python labctl.py score long-20h-003     # -> scores/long-20h-003/report-scorer-2.1.0/
+python labctl.py score long-20h-003     # -> scores/long-20h-003/report-scorer-3.0.0/
 ```
 
 | File | Content |

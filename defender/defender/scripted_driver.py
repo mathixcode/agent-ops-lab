@@ -175,4 +175,4 @@ class ScriptedDriver:
 
     def status(self) -> dict[str, Any]:
         return {"driver": self.name, "model": "none (scripted stand-in)", "agent_turns": self.ticks,
-                "last_error": self.last_error}
+                "tick_seconds": self.tick_seconds, "last_error": self.last_error}

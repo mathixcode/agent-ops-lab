@@ -2,7 +2,9 @@
 
     reset target -> baseline snapshot -> run_start -> start defender
     -> [ run clock: load, scheduled faults and ops tasks, probes, snapshots, collection ]
-    -> stop defender -> final snapshot + integrity check -> final collection -> run_end
+    -> end-of-run snapshot -> stop defender (probes and checks still running)
+    -> stop probes, checks, collectors, load -> final snapshot + integrity check
+    -> final collection -> run_end
 
 Everything the orchestrator knows about the run (seed, schedule, canaries) stays on the
 observer. The defender is told only what an operator would know: nothing about the schedule.
@@ -39,10 +41,11 @@ from labcontracts import manifest as mf, network, telemetry
 
 from . import identities
 from .clients import DefenderAPI, GatewayAPI, Hypervisor, TargetSSH, Unreachable
-from .collectors import GatewayCollector, LangfuseCollector, TargetCollector
+from .collectors import CollectorOutages, GatewayCollector, LangfuseCollector, TargetCollector
 from .config import Config
 from .emitter import Emitter
 from .faults import FAULTS, await_effect
+from .guest_snapshot import PSEUDO_PATHS
 from .org import OrgResponder
 from .prober import Prober
 from .store import Store
@@ -118,6 +121,8 @@ class Orchestrator:
         self.loops: list[Loop] = []
         self.load_thread: threading.Thread | None = None
         self._config_seq_seen = -1
+        self.outages: CollectorOutages | None = None
+        self.defender_stopped = False
 
     # ------------------------------------------------------------------ phases
     def prepare_target(self) -> None:
@@ -183,7 +188,7 @@ class Orchestrator:
         try:
             collectors = [GatewayCollector(self.store, m.run_id, self.gateway),
                           TargetCollector(cfg, self.store, m.run_id, self.ssh, t0, prober.scanner,
-                                          prober.journal_hits),
+                                          prober.journal_hits, prober.journal_lock),
                           LangfuseCollector(cfg, self.store, m.run_id, t0)]
             plan = resolve_schedule(m, cfg.event_jitter)
             self.store.run_started(m.run_id, m.to_dict(), telemetry.format_ts(t0))
@@ -192,14 +197,32 @@ class Orchestrator:
             raise
 
         # From here on the run is on record: whatever happens, it gets exactly one teardown.
+        self.outages = CollectorOutages(monitor.emit, since=t0)
         try:
             reason, detail = self._execute(monitor, prober, collectors, plan, t0, t0_mono, hv_status)
         except Exception as exc:
             log.exception("the run was aborted by an unexpected error")
             reason, detail = "orchestrator_error", f"{type(exc).__name__}: {exc}"
+        return self._end_run(monitor, prober, collectors, t0_mono, reason, detail)
+
+    def _end_run(self, monitor: Emitter, prober: Prober, collectors: list, t0_mono: float, reason: str,
+                 detail: str | None) -> int:
+        """The defender goes first, while probes, checks and collectors still run: whatever it
+        does until it has stopped is measured. A ground-truth snapshot just before gives its
+        final notes (written as it stops) a ground truth taken at or before them (metric 3).
+        Then the background work stops, then the teardown."""
+        if not self.stop.is_set():
+            self._quietly("operator paths", lambda: self._refresh_operator_paths(prober))
+            self._quietly("end-of-run snapshot", lambda: prober.snapshot("end_of_run"))
+        self._stop_defender()
         self.stop.set()
         self._stop_background(reason)
         return self._finish(monitor, prober, collectors, t0_mono, reason, detail)
+
+    def _stop_defender(self) -> None:
+        if not self.defender_stopped:
+            self.defender_stopped = True
+            self._quietly("defender stop", self.defender.stop)
 
     def _execute(self, monitor: Emitter, prober: Prober, collectors: list, plan: list[PlannedEvent],
                  t0: dt.datetime, t0_mono: float, hv_status: dict) -> tuple[str, str | None]:
@@ -244,7 +267,7 @@ class Orchestrator:
             monitor.emit("probe_result", {
                 "check": "defender_process", "ok": bool(st.get("running")) and st.get("run_id") == m.run_id,
                 "driver": st.get("driver"), "agent_turns": st.get("agent_turns"),
-                "driver_error": (st.get("last_error") or None)})
+                "tick_seconds": st.get("tick_seconds"), "driver_error": (st.get("last_error") or None)})
 
         def checks() -> None:
             # Every step on its own: one that fails never costs the round's other measurements.
@@ -252,10 +275,11 @@ class Orchestrator:
             steps = (("defender_process", defender_alive),
                      ("guest_cycle", lambda: facts.update(prober.cycle())),     # health, fault facts, text
                      ("service_health", lambda: prober.service_health(facts)),
+                     ("harness_channels", lambda: prober.harness_channels(facts)),
                      ("fault_conditions", lambda: prober.fault_conditions(facts=facts)),
                      ("security", prober.security_checks),
                      ("canaries", lambda: prober.canary_checks(facts)),
-                     ("tasks", lambda: prober.task_checks(list(self.assigned_tasks))))
+                     ("tasks", lambda: prober.task_checks(list(self.assigned_tasks), facts)))
             for name, step in steps:
                 try:
                     step()
@@ -272,9 +296,10 @@ class Orchestrator:
         self.loops = [
             Loop("http-probe", cfg.http_probe_interval, prober.http_probe, self.stop),
             Loop("checks", cfg.check_interval, checks, self.stop),
-            Loop("collect-target", cfg.collect_interval, collect_target.pull, self.stop),
-            Loop("collect-gateway", cfg.collect_interval, collect_gateway.pull, self.stop),
-            Loop("collect-defender", cfg.collect_interval, collect_defender.pull, self.stop),
+            Loop("collect-target", cfg.collect_interval, self.outages.guard("target", collect_target.pull), self.stop),
+            Loop("collect-gateway", cfg.collect_interval, self.outages.guard("gateway", collect_gateway.pull), self.stop),
+            Loop("collect-defender", cfg.collect_interval, self.outages.guard("defender", collect_defender.pull),
+                 self.stop),
             Loop("org-responder", 60, self.responder.poll, self.stop),
         ]
         for loop in self.loops:
@@ -470,6 +495,7 @@ class Orchestrator:
                                            "error": f"{type(exc).__name__}: {exc}"[:300]})
             return
         delivered = telemetry.utc_now()
+        prober.task_assigned_at.setdefault(task.ref, delivered.timestamp())
         self.assigned_tasks.append(task.ref)
         monitor.emit("task_assigned", {**base, "channel": "issue", "ticket": {k: ticket[k] for k in ("repo", "number", "url")},
                                        "title": task.title, "trap": task.trap, "assigned": True, "setup": setup,
@@ -482,13 +508,15 @@ class Orchestrator:
 
     def _refresh_operator_paths(self, prober: Prober) -> None:
         """Every path the operator account touched so far (audit mirror) is added to the
-        ground-truth snapshot, so the scorer can see it return to its golden content."""
+        ground-truth snapshot, so the scorer can see it return to its golden content. Pseudo
+        filesystems (/sys, /proc, /dev, /run/user) are not: they hold no configuration."""
         for ev in self.store.events("ground_truth", self.m.run_id, source="target", type="config_change",
                                     min_seq=self._config_seq_seen + 1):
             self._config_seq_seen = max(self._config_seq_seen, ev["seq"])
             p = ev["payload"]
             if p.get("actor") == "operator" and p.get("kind") in ("file_change", "perm_change"):
-                prober.operator_paths.update(x for x in p.get("paths", []) if x.startswith("/"))
+                prober.operator_paths.update(x for x in p.get("paths", [])
+                                             if x.startswith("/") and not x.startswith(PSEUDO_PATHS))
 
     def _start_load(self) -> subprocess.Popen:
         # The load generator stops by itself when this process goes away (it watches its parent
@@ -514,11 +542,20 @@ class Orchestrator:
 
     def _finish(self, monitor: Emitter, prober: Prober, collectors: list, t0_mono: float, reason: str,
                 detail: str | None = None) -> int:
-        """Teardown. The defender is stopped first so its last state snapshot is part of the run.
-        Every step is on its own: none of them can keep run_end from being written."""
+        """Teardown. The defender has normally been stopped already, at the end of the run clock
+        (its last state snapshot is part of the run); this makes sure. Every step is on its own:
+        none of them can keep run_end from being written."""
         self._quietly("status file", lambda: self.write_status("teardown"))
         log.info("teardown (%s)", reason)
-        self._quietly("defender stop", self.defender.stop)
+        if not getattr(self, "defender_stopped", False):
+            self.defender_stopped = True
+            self._quietly("defender stop", self.defender.stop)
+        outages = getattr(self, "outages", None)
+        names = {GatewayCollector: "gateway", TargetCollector: "target", LangfuseCollector: "defender"}
+
+        def tracked(collector, fn):
+            name = names.get(type(collector))
+            return outages.guard(name, fn) if outages is not None and name else fn
 
         def final_snapshot() -> None:
             self._refresh_operator_paths(prober)
@@ -539,13 +576,15 @@ class Orchestrator:
             while quiet < 2 and time.time() < deadline:
                 time.sleep(8)
                 try:
-                    quiet = quiet + 1 if not langfuse.pull() else 0
+                    quiet = quiet + 1 if not tracked(langfuse, langfuse.pull)() else 0
                 except Exception as exc:
                     log.warning("final pull of the defender's events: %s", str(exc)[:200])
-            self._quietly("full pull of the defender's events", lambda: langfuse.pull(full=True))
+            self._quietly("full pull of the defender's events", tracked(langfuse, lambda: langfuse.pull(full=True)))
         for collector in collectors:
             if not isinstance(collector, LangfuseCollector):
-                self._quietly(f"final pull {type(collector).__name__}", collector.pull)
+                self._quietly(f"final pull {type(collector).__name__}", tracked(collector, collector.pull))
+        if outages is not None:                 # a collector still failing now stays dark: on record
+            self._quietly("collector outages", outages.close_all)
         self._quietly("gateway end_run", self.gateway.end_run)
         payload = {"reason": reason, "elapsed_s": round(time.monotonic() - t0_mono, 1),
                    "counts": self.store.counts(self.m.run_id)}

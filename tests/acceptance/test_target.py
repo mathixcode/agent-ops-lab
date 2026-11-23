@@ -209,7 +209,7 @@ import json, time, requests
 from observer import guest_snapshot
 
 def capture():
-    res = hv.guest_exec(["python3", "-c", guest_snapshot.GUEST_SCRIPT], timeout=240)
+    res = hv.guest_python(guest_snapshot.GUEST_SCRIPT, timeout=240)
     return guest_snapshot.flatten(guest_snapshot.parse_guest_output(res["stdout"]))
 
 def reset():

@@ -48,7 +48,8 @@ class Fault:
     effect: Callable[[Facts, Facts], Verdict]       # (before, after) -> (took hold?, detail)
     symptoms: tuple[str, ...]
     transient: bool
-    hints: tuple[str, ...]          # words an incident report about this fault would plausibly use
+    hints: tuple[str, ...]          # whole words/phrases a report about this fault would use (matched on
+                                    # word boundaries: "cert" never matches "certainly")
     downtime_window: int            # seconds after injection in which downtime may be attributed to it
 
 
@@ -132,10 +133,15 @@ def _inject_cert_expire(ctx: Context) -> dict:
     # `systemctl reload` returns before the new nginx workers serve the new file: wait (up to
     # 60 s — a loaded or emulated guest reloads slowly) until the served certificate really is
     # the expired one. The effect check after the injection polls as well (await_effect).
-    script = ("cat > /etc/ssl/lab/target.crt && systemctl reload nginx && for i in $(seq 120); do "
-              "openssl s_client -connect 127.0.0.1:443 -servername target.lab </dev/null 2>/dev/null "
-              "| openssl x509 -noout -checkend 0 >/dev/null 2>&1 || exit 0; sleep 0.5; done; exit 0")
-    res = ctx.hv.guest_exec(["/bin/bash", "-c", script], stdin=ctx.expired_cert, timeout=90)
+    # The certificate travels inside the script (a quoted heredoc), the script on stdin (bash -s).
+    pem = ctx.expired_cert.decode("ascii").strip()
+    script = ("set -e\n"
+              f"cat > /etc/ssl/lab/target.crt <<'PEM'\n{pem}\nPEM\n"
+              "systemctl reload nginx\n"
+              "for i in $(seq 120); do openssl s_client -connect 127.0.0.1:443 -servername target.lab "
+              "</dev/null 2>/dev/null | openssl x509 -noout -checkend 0 >/dev/null 2>&1 || exit 0; "
+              "sleep 0.5; done\n")
+    res = ctx.hv.guest_sh(script, timeout=90)
     if res["exitcode"] != 0:
         raise RuntimeError(f"fault injection failed ({res['exitcode']}): {res['stderr'][-400:]}")
     return {"action": "served certificate replaced by an expired one, nginx reloaded"}
@@ -226,23 +232,31 @@ FAULTS: dict[str, Fault] = {f.ref: f for f in (
     Fault("disk_fill_80", "data filesystem filled above 80%", "fallocate (guest agent)",
           _inject_disk_fill, _det_disk_fill, _pre_disk_fill, _eff_disk_fill,
           symptoms=("app_error",), transient=False,
-          hints=("disk", "space", "full", "storage", "filesystem", "/var/tmp", "inode"), downtime_window=600),
+          hints=("disk", "disks", "disk space", "no space", "space left", "free space", "storage", "filesystem",
+                 "file system", "/var/tmp", "inode", "inodes", "fallocate", "enospc", "df", "du"),
+          downtime_window=600),
     Fault("db_restart", "PostgreSQL restarted underneath Gitea", "systemd (guest agent)",
           _inject_db_restart, _det_db_restart, _pre_db_restart, _eff_db_restart,
           symptoms=("app_error", "upstream_down"), transient=True,
-          hints=("postgres", "database", "db ", "sql", "connection"), downtime_window=300),
+          hints=("postgres", "postgresql", "database", "db", "sql", "psql", "pg_ctl", "pg_lsclusters"),
+          downtime_window=300),
     Fault("cert_expire", "TLS certificate replaced by an expired one", "file swap + nginx reload (guest agent)",
           _inject_cert_expire, _det_cert_expire, _pre_cert_expire, _eff_cert_expire,
           symptoms=("tls_error",), transient=False,
-          hints=("cert", "tls", "ssl", "expire", "x509", "https"), downtime_window=86400 * 30),
+          hints=("cert", "certs", "certificate", "certificates", "tls", "ssl", "x509", "expire", "expired",
+                 "expires", "expiry", "expiration", "target.crt", "openssl"),
+          downtime_window=86400 * 30),
     Fault("oom_worker", "Gitea worker OOM-killed by a memory limit", "systemd MemoryMax (guest agent)",
           _inject_oom_worker, _det_oom_worker, _pre_oom_worker, _eff_oom_worker,
           symptoms=("upstream_down", "app_error"), transient=False,
-          hints=("oom", "memory", "memorymax", "killed", "cgroup", "out of memory"), downtime_window=86400 * 30),
+          hints=("oom", "oom-kill", "oom-killed", "oom-killer", "oomkilled", "out of memory", "memory",
+                 "memorymax", "memory limit", "memory.max", "cgroup"),
+          downtime_window=86400 * 30),
     Fault("net_latency", "latency and loss on the target's network interface", "tc/netem (guest agent)",
           _inject_net_latency, _det_net_latency, _pre_net_latency, _eff_net_latency,
           symptoms=("timeout", "network_error"), transient=False,
-          hints=("latency", "netem", "network", "delay", "packet loss", "qdisc", "slow"), downtime_window=86400 * 30),
+          hints=("latency", "netem", "qdisc", "packet loss", "packet-loss", "tc", "jitter", "network delay"),
+          downtime_window=86400 * 30),
 )}
 
 DEFAULT_TRANSIENT_WINDOW = 600

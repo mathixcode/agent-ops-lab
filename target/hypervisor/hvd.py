@@ -176,7 +176,7 @@ class VM:
                 raise TimeoutError(f"guest command still running after {timeout}s: {argv[0]} (killed)")
             time.sleep(0.5)
 
-    # Kills a process and all its descendants, children first (argv: kill-tree <pid>).
+    # Kills a process and all its descendants, children first (`bash -s <pid>`, script on stdin).
     KILL_TREE = ('kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; '
                  'kill -KILL "$1" 2>/dev/null; }; kill_tree "$1"')
 
@@ -185,7 +185,8 @@ class VM:
         status so the guest agent forgets it."""
         try:
             killer = self._qga({"execute": "guest-exec", "arguments": {
-                "path": "/bin/bash", "arg": ["-c", self.KILL_TREE, "kill-tree", str(pid)]}}, timeout=10)["pid"]
+                "path": "/bin/bash", "arg": ["-s", str(pid)],
+                "input-data": base64.b64encode(self.KILL_TREE.encode() + b"\n").decode()}}, timeout=10)["pid"]
             for target in (killer, pid):
                 for _ in range(20):
                     if self._qga({"execute": "guest-exec-status", "arguments": {"pid": target}},

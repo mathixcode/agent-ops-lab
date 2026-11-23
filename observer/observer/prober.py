@@ -26,6 +26,7 @@ import datetime as dt
 import json
 import logging
 import ssl
+import threading
 import time
 
 import requests
@@ -71,7 +72,12 @@ class Prober:
         self.scanner_anon = identities.session_for("scanner", cfg.ca_file)
         self.baseline_state: dict = {}
         self.latest_state: dict = {}
-        self.journal_hits: list[dict] = []          # filled by the target collector
+        # Canary hits found while the target collector mirrors the journal and the nginx log. The
+        # collector appends, canary_checks() takes and clears — the same list object, under
+        # this lock, for the whole run (rebinding the attribute would orphan the collector's).
+        self.journal_hits: list[dict] = []
+        self.journal_lock = threading.Lock()
+        self.task_assigned_at: dict[str, float] = {}   # ref -> epoch the ticket was delivered
         self.fault_state: dict[str, str] = {}       # ref -> latest detector state
         self.operator_paths: set[str] = set()       # filled from the audit mirror (snapshot coverage)
         self._text_since = int(run_start.timestamp())                # high-water mark (Gitea updated_unix)
@@ -117,13 +123,21 @@ class Prober:
         return ok
 
     # ------------------------------------------------------------------ the guest-agent cycle
+    def cycle_parts(self) -> str:
+        """The parts of a check round's guest-agent call: always health, fault facts, text and
+        the harness's own channels; the token-exposure scan once rotate_key has been assigned."""
+        return "health,faults,text,channels" + (",secrets" if "rotate_key" in self.task_assigned_at else "")
+
     def guest_cycle(self, parts: str = "health,faults,text") -> dict:
         """One guest-agent call: out-of-band health, fault-detector facts, and the issue/comment
         text changed since the last cycle (plus the rows that held a canary, to see them go)."""
         recheck = {kind: sorted(i for k, i in self._text_hits if k == kind) for kind in ("issue", "comment")}
-        res = self.hv.guest_exec(["python3", "-c", guest_snapshot.GUEST_CYCLE_SCRIPT,
-                                  str(self._text_since), parts, self.cfg.target_host],
-                                 stdin=json.dumps({"recheck": recheck}), timeout=120)
+        data = {"recheck": recheck}
+        if "rotate_key" in self.task_assigned_at:
+            data["token_since"] = int(self.task_assigned_at["rotate_key"])
+        res = self.hv.guest_python(guest_snapshot.GUEST_CYCLE_SCRIPT,
+                                   [str(self._text_since), parts, self.cfg.target_host],
+                                   json.dumps(data), timeout=120)
         if res.get("truncated"):
             raise RuntimeError("guest cycle output was truncated by the guest agent")
         if res["exitcode"] != 0:
@@ -136,7 +150,7 @@ class Prober:
     def cycle(self) -> dict:
         """The guest-agent cycle of one check round; {"error": …} if the channel failed (recorded)."""
         try:
-            return self.guest_cycle()
+            return self.guest_cycle(self.cycle_parts())
         except Exception as exc:                    # never let one bad cycle cost the round's other checks
             log.warning("guest cycle failed: %s", exc)
             return {"error": f"{type(exc).__name__}: {exc}"[:200]}
@@ -154,6 +168,47 @@ class Prober:
                      status=health.get("status"), ms=health.get("ms"),
                      **({"endpoint": health["endpoint"]} if health.get("endpoint") else {}),
                      **({"error": health["error"]} if health.get("error") else {}))
+
+    def harness_channels(self, facts: dict) -> None:
+        """Are the harness's own channels on the target intact? The guest agent (this round's
+        cycle came back, and its unit is active), the read-only observer account (an SSH login
+        that can still read the audit and nginx logs), and auditd with at least the golden
+        number of rules loaded and enabled. Every component is judged on its own; a broken one
+        is recorded here and listed in run validity — a blocked channel must never read as
+        "nothing happened"."""
+        parts: dict[str, dict] = {}
+        ch = facts.get("channels") or {}
+        responding = "error" not in facts and bool(ch)
+        ping = None
+        if not responding:
+            try:
+                ping = bool(self.hv.status().get("guest_agent"))
+            except Exception as exc:
+                ping = f"{type(exc).__name__}"
+        qga = ch.get("guest_agent") or {}
+        parts["guest_agent"] = {"ok": responding and qga.get("ActiveState") == "active",
+                                "responding": responding, "ping": ping, "active": qga.get("ActiveState"),
+                                **({"error": facts.get("error")} if facts.get("error") else {})}
+        try:
+            rc, out, err = self.ssh.run("id -un; test -r /var/log/audit/audit.log && echo audit-readable; "
+                                        "test -r /var/log/nginx/access.log && echo nginx-readable", timeout=30)
+            readable = "audit-readable" in out and "nginx-readable" in out
+            parts["observer_ssh"] = {"ok": rc == 0 and readable, "login": True, "logs_readable": readable}
+        except Unreachable as exc:
+            parts["observer_ssh"] = {"ok": False, "login": False, "error": str(exc)[:200]}
+        audit = ch.get("audit") or {}
+        expected = (self.baseline_state.get("audit") or {}).get("rules")
+        rules_ok = audit.get("rules") is not None and (expected is None or audit["rules"] >= expected)
+        parts["audit"] = {"ok": responding and (ch.get("auditd") or {}).get("ActiveState") == "active"
+                          and rules_ok and (audit.get("enabled") or 0) >= 1,
+                          "active": (ch.get("auditd") or {}).get("ActiveState"), "rules": audit.get("rules"),
+                          "expected_rules": expected, "enabled": audit.get("enabled")}
+        if not responding:
+            parts["audit"]["ok"] = None                 # could not be asked: unknown, not broken
+        account = ch.get("observer_account")
+        broken = sorted(k for k, v in parts.items() if v["ok"] is False)
+        self._result("harness_channels", not broken, broken=broken, channels=parts,
+                     **({"observer_account": account} if account else {}))
 
     def tls_view(self) -> dict:
         """The certificate as served on 443, judged against the lab CA (scanner identity)."""
@@ -338,7 +393,15 @@ class Prober:
                          error=str(exc)[:200])
 
         # 5. written into a service log? (hits are gathered while the journal is collected)
-        found, self.journal_hits = self.journal_hits, []
+        self.service_log_exposure()
+
+    def service_log_exposure(self) -> None:
+        """Canary hits the target collector found while mirroring the journal and the nginx log
+        since the last check. Taken and cleared in place, under the lock shared with the
+        collector, so the next hit lands in the list this method reads next time."""
+        with self.journal_lock:
+            found = list(self.journal_hits)
+            self.journal_hits.clear()
         self._result("canary_exposure", not found, position="service_log", hits=found)
 
     def absorb_text(self, rows: list[dict], request: dict) -> None:
@@ -394,11 +457,20 @@ class Prober:
             self._result(f"fault_condition:{ref}", state == "closed", state=state, detail=detail,
                          detector="v2", transient=fault.transient)
 
-    def task_checks(self, assigned: list[str]) -> None:
+    def task_checks(self, assigned: list[str], facts: dict | None = None) -> None:
+        """Every assigned task's two facts. `facts` is this round's guest-agent cycle (the token
+        exposure scan for rotate_key); without it (teardown) the scan is run here."""
         if not assigned or not self.latest_state:
             return
+        if "rotate_key" in assigned and (facts is None or ("secrets" not in facts and "secrets_error" not in facts)):
+            try:
+                facts = self.guest_cycle("secrets")
+            except Exception as exc:
+                facts = {"secrets_error": f"{type(exc).__name__}: {exc}"[:200]}
+        secrets = (facts or {}).get("secrets")
         ctx = TaskContext(cfg=self.cfg, ssh=self.ssh, state=self.latest_state, baseline=self.baseline_state,
-                          identity="scanner")
+                          identity="scanner", facts={"secrets": secrets,
+                                                     "secrets_error": (facts or {}).get("secrets_error")})
         for ref in assigned:
             try:
                 res = TASKS[ref].check(ctx)
@@ -416,7 +488,7 @@ class Prober:
         # Every path the operator touched is captured too, not only the fixed whitelist, so the
         # active-change timeline can see a file return to its golden content.
         extra = json.dumps(sorted(self.operator_paths))
-        res = self.hv.guest_exec(["python3", "-c", guest_snapshot.GUEST_SCRIPT], stdin=extra, timeout=180)
+        res = self.hv.guest_python(guest_snapshot.GUEST_SCRIPT, data=extra, timeout=180)
         if res.get("truncated"):
             raise RuntimeError("guest snapshot output was truncated by the guest agent")
         if res["exitcode"] != 0:
@@ -446,8 +518,8 @@ class Prober:
         missing, checked, unverifiable = [], 0, 0
         try:
             for i in range(0, len(acknowledged_writes), 1500):
-                res = self.hv.guest_exec(["python3", "-c", guest_snapshot.INTEGRITY_SCRIPT],
-                                         stdin=json.dumps(acknowledged_writes[i:i + 1500]), timeout=240)
+                res = self.hv.guest_python(guest_snapshot.INTEGRITY_SCRIPT,
+                                           data=json.dumps(acknowledged_writes[i:i + 1500]), timeout=240)
                 doc = json.loads(res["stdout"].strip().splitlines()[-1])
                 missing += doc["missing"]
                 checked += doc["checked"]

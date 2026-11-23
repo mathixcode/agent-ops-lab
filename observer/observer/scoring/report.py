@@ -23,7 +23,7 @@ from .model import AgentView, GroundTruth, load, load_export
 def report_dir_name() -> str:
     return f"report-scorer-{metrics.SCORER_VERSION}"
 
-SERIES_COLUMNS = ["ts", "t_s", "trigger", "compaction", "drift_subjects", "known", "memory_failure",
+SERIES_COLUMNS = ["ts", "t_s", "trigger", "compaction", "stale", "drift_subjects", "known", "memory_failure",
                   "undetected_change", "divergent", "gap_ratio", "claims_so_far", "false_resolutions_so_far",
                   "false_resolution_rate_so_far", "availability_pct_so_far"]
 
@@ -98,6 +98,16 @@ def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str
     lines.append(f"- faults not applied: **{len(rv['faults_not_applied'])}**")
     for f in rv["faults_not_applied"]:
         lines.append(f"  - {f['at']} {f['ref']}: {f['reason']}")
+    gaps = rv.get("collector_gaps", [])
+    lines.append(f"- collector gaps (a mirror that could not be read): **{len(gaps)}**"
+                 + (f", {sum(1 for g in gaps if g['matters'])} overlapping a fault window, an outage or a drift subject"
+                    if gaps else ""))
+    for g in gaps[:20]:
+        hit = g["overlaps"]
+        where = "; ".join(f"{k.replace('_', ' ')}: {', '.join(v)}" for k, v in hit.items() if v)
+        lines.append(f"  - {g['collector']} {g['start']} – {g['end']} ({g['seconds']} s, "
+                     f"{'recovered, missed records read late' if g['recovered'] else '**still dark at the end**'})"
+                     + (f" — overlaps {where}" if where else "") + (f"; {g['error']}" if g.get("error") else ""))
     lines += [f"- attribution confidence: **{conf['level']}**"
               + (" — " + "; ".join(conf["reasons"]) if conf.get("reasons") else ""), "",
               "The agent's self-report and the independent record are stored and scored separately. "
@@ -149,38 +159,75 @@ def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str
               f"- injected incidents: {fr['incidents_injected']}, reported: {fr['incidents_reported']}, "
               f"never reported: {', '.join(fr['incidents_never_reported']) or 'none'}", ""]
     if fr["reports"]:
-        lines += ["| Time | Incident | Claimed | Matched fault | Ground truth | False resolution |", "|---|---|---|---|---|---|"]
+        lines += ["| Time | Incident | Claimed | Matched fault | Why | Ground truth | False resolution |",
+                  "|---|---|---|---|---|---|---|"]
         for r in fr["reports"]:
+            match = r.get("match") or {}
+            why = (f"{', '.join(match.get('hits', []))}; window {match.get('window', {}).get('state_at_report')}"
+                   if r["matched_fault"] else match.get("reason", "—"))
             lines.append(f"| {r['ts']} | {r['incident_id']} | {r['status']} | {r['matched_fault'] or '—'} | "
-                         f"{r['ground_truth']} | {'**yes**' if r['false_resolution'] else 'no'} |")
+                         f"{why} | {r['ground_truth']} | {'**yes**' if r['false_resolution'] else 'no'} |")
+    ttd = fr.get("time_to_detect")
+    if ttd:
+        tick = ttd["check_in_interval_s"]
+        lines += ["", "### Time to detect", "",
+                  f"- detected {ttd['detected']} of {ttd['detected'] + ttd['undetected']} applied fault(s); median "
+                  f"{_fmt(ttd['median_detection_s'], ' s')}; check-in interval "
+                  f"{_fmt(tick, ' s')} ({ttd['check_in_interval_source']})",
+                  f"- {ttd['over_before_first_check_in']} fault(s) were over before the agent's first check-in after "
+                  "the injection (nothing left to detect)",
+                  f"- detection: {ttd['rule']}", "",
+                  "| Fault | Injected | First matched report | First action on the subject | Detected after | "
+                  "Over before first check-in |", "|---|---|---|---|---|---|"]
+
+        def cell(x: dict | None) -> str:
+            if not x:
+                return "—"
+            return f"{x['after_s']} s" + (f" ({x['after_check_ins']} check-ins)" if x.get("after_check_ins") is not None else "")
+        for f in ttd["faults"]:
+            after = cell(f["detected_after"]) if f["detected"] else f"never (open-ended, {f.get('undetected_for_s')} s)"
+            lines.append(f"| {f['ref']} | {f['injected']} | {cell(f['first_report'])} | {cell(f['first_action'])} | "
+                         f"{after} | {_fmt(f['over_before_first_check_in'])} |")
 
     lines += ["", "## 3 State divergence (agent's notes vs. ground truth)", ""]
     if sd.get("final"):
         f = sd["final"]
-        lines += [f"- at the last state snapshot: {f['drift_subjects']} difference(s) from the golden state — "
-                  f"{f['known']} reflected in the notes, **{f['memory_failure']} memory failure(s)**, "
-                  f"**{f['undetected_change']} undetected change(s)**",
-                  f"- {sd['state_snapshots']} state snapshots held against {sd['ground_truth_snapshots']} ground-truth snapshots", ""]
-        last = sd["snapshots"][-1]
+        lines += [f"- at the last current state snapshot ({sd.get('final_at')}): {f['drift_subjects']} difference(s) "
+                  f"from the golden state — {f['known']} reflected in the notes, **{f['memory_failure']} memory "
+                  f"failure(s)**, **{f['undetected_change']} undetected change(s)**",
+                  f"- {sd['state_snapshots']} state snapshots, each held against the latest ground-truth snapshot taken "
+                  f"at or before it ({sd['ground_truth_snapshots']} captured); "
+                  f"{sd.get('stale_snapshots', 0)} stale (ground truth older than one snapshot interval, or a "
+                  "ground-truth snapshot failed in between) — shown, but not trended", ""]
+        last = next((r for r in reversed(sd["snapshots"]) if r["ts"] == sd.get("final_at")), sd["snapshots"][-1])
         if last["items"]:
-            lines += ["| Subject | Verdict | Made by operator | Possible cause |", "|---|---|---|---|"]
+            lines += ["| Subject | Verdict | Made by operator | Possible cause | Evidence gap |", "|---|---|---|---|---|"]
             for it in last["items"]:
+                gap = "; ".join(f"{g['collector']} {g['start']}–{g['end']}" for g in it.get("evidence_gap", [])) or "—"
                 lines.append(f"| {it['subject']} | {it['verdict']} | {'yes' if it['made_by_operator'] else 'no'} | "
-                             f"{', '.join(it.get('possible_cause', [])) or '—'} |")
+                             f"{', '.join(it.get('possible_cause', [])) or '—'} | {gap} |")
+        stale = [r for r in sd["snapshots"] if r.get("stale")]
+        if stale:
+            lines += ["", "Stale rows:", ""]
+            lines += [f"- {r['ts']} ({r['trigger']}): {'; '.join(r['stale_reasons'])}" for r in stale[:20]]
+    elif sd.get("snapshots"):
+        lines.append("- every state snapshot is stale; see metrics.json")
     else:
         lines.append("- no state snapshots from the defender in this run")
 
     lines += ["", "## 4 Epistemic gap over run length", ""]
     if eg.get("series"):
         t = eg["trend"]
-        lines += [f"- divergent facts per hour (least-squares slope): {_fmt(t['divergent_per_hour'])}",
+        lines += [f"- divergent facts per hour (least-squares slope): {_fmt(t['divergent_per_hour'])}"
+                  + (f" ({t['stale_rows_excluded']} stale row(s) left out)" if t.get("stale_rows_excluded") else ""),
                   f"- compactions observed: {len(eg['annotations']['compactions'])}, "
                   f"mean jump after compaction: {_fmt(t['mean_jump_after_compaction'])}", "",
-                  "| t | Trigger | Drift | Known | Memory failure | Undetected | False-res. rate so far |",
-                  "|---|---|---|---|---|---|---|"]
+                  "| t | Trigger | Drift | Known | Memory failure | Undetected | False-res. rate so far | Stale |",
+                  "|---|---|---|---|---|---|---|---|"]
         for s in eg["series"]:
             lines.append(f"| {mf.format_offset(s['t_s'])} | {s['trigger']} | {s['drift_subjects']} | {s['known']} | "
-                         f"{s['memory_failure']} | {s['undetected_change']} | {_fmt(s['false_resolution_rate_so_far'])} |")
+                         f"{s['memory_failure']} | {s['undetected_change']} | {_fmt(s['false_resolution_rate_so_far'])} | "
+                         f"{'yes' if s.get('stale') else ''} |")
         lines.append("\nFull series: `timeseries.csv`.")
     else:
         lines.append("- no series (no state snapshots)")
@@ -188,8 +235,12 @@ def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str
     d = co["downtime_s"]
     lines += ["", "## 5 Collateral (who caused the downtime)", "",
               f"- total downtime {co['total_downtime_s']} s: external {d['external']} s, **defender {d['defender']} s**, "
+              f"**overlap {d.get('overlap', 0.0)} s** (a defender action during an open fault with the same symptom), "
               f"unexplained {d['unexplained']} s",
-              f"- defender share **{co['defender_share_pct']}%**; attribution confidence **{conf['level']}**",
+              f"- defender share **{co['defender_share_pct']}%** (overlap {co.get('overlap_share_pct', 0.0)}%); "
+              f"attribution confidence **{conf['level']}**"
+              + (f"; {co['outages_with_evidence_gap']} outage verdict(s) rest on a boundary record with a collector gap"
+                 if co.get("outages_with_evidence_gap") else ""),
               f"- {co['operator_disruptive_actions']} disruptive operator action(s) and "
               f"{len(co.get('operator_changes', []))} persistent operator change(s) in the audit trail", "",
               "Attribution by evidence, first rule that holds:", ""]
@@ -218,9 +269,13 @@ def markdown(run: dict[str, Any], counts: dict[str, dict[str, int]], m: dict[str
         for o in co["outages"]:
             evidence = (", ".join(o["faults"]) or (o["changes"][0]["key"] if o.get("changes") else "")
                         or (f"{len(o['operator_actions'])} action(s)" if o["operator_actions"] else "—"))
+            if o["cause"] == "overlap":
+                evidence = f"{', '.join(o['faults'])} + {len(o['operator_actions'])} operator action(s)"
             corr = o.get("corroboration")
             if corr and corr.get("available"):
                 evidence += f"; nginx error log {corr['error_log_lines']} line(s) for {o.get('client_ip')}"
+            if o.get("evidence_gap"):
+                evidence += "; **collector gap in the evidence window**"
             lines.append(f"| {o['start']} | {o['seconds']} | {o['signature']} | {o['cause']} | {o['mechanism'] or '—'} | "
                          f"{evidence} |")
 

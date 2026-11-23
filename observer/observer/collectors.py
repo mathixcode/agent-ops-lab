@@ -9,6 +9,12 @@
     LangfuseCollector  -> agent view     defender/* (the agent's self-report, via Langfuse)
 
 Only LangfuseCollector may write to the agent-view layer, and it can write nowhere else.
+
+CollectorOutages records every failure streak of a collector as ground truth
+(monitor/collector_outage: collector, start, end, error, recovered) — a dark audit or nginx
+mirror must never read as "the operator did nothing". `recovered` says whether the collector
+came back during the run; the cursor-based ones (target logs, gateway log) and the Langfuse
+collector (full sweep at teardown) then read what they had missed.
 """
 from __future__ import annotations
 
@@ -17,6 +23,8 @@ import json
 import logging
 import re
 import shlex
+import threading
+from typing import Any, Callable
 
 import requests
 
@@ -158,17 +166,18 @@ class TargetCollector:
     """Mirrors the target's own records over the read-only SSH account."""
 
     def __init__(self, cfg: Config, store: Store, run_id: str, ssh: TargetSSH, run_start: dt.datetime,
-                 scanner: canary.Scanner, journal_hits: list[dict]) -> None:
+                 scanner: canary.Scanner, journal_hits: list[dict],
+                 journal_lock: threading.Lock | None = None) -> None:
         self.ssh = ssh
         self.out = Emitter(store, run_id, source="target")
         self.run_start = run_start
         self.scanner = scanner
-        self.journal_hits = journal_hits
+        self.journal_hits = journal_hits            # the prober's list: appended to, never rebound
+        self.journal_lock = journal_lock or threading.Lock()
         uids = cfg.golden().get("uids", {})
         self.uid_names = {int(uid): name for name, uid in uids.items()}
         self.cursor = {"audit_inode": "", "audit_lines": 0, "nginx_inode": "", "nginx_lines": 0,
                        "err_inode": "", "err_lines": 0, "journal": ""}
-        self.unreachable_since: dt.datetime | None = None
 
     def pull(self) -> dict[str, int]:
         journal_from = (f"--after-cursor={shlex.quote(self.cursor['journal'])}" if self.cursor["journal"]
@@ -287,8 +296,10 @@ class TargetCollector:
         return n
 
     def _note_canaries(self, text: str, unit: str) -> None:
-        for cid, encoding in self.scanner.scan(text):
-            self.journal_hits.append({"canary_id": cid, "unit": unit, "encoding": encoding})
+        hits = [{"canary_id": cid, "unit": unit, "encoding": encoding} for cid, encoding in self.scanner.scan(text)]
+        if hits:
+            with self.journal_lock:
+                self.journal_hits.extend(hits)
 
     def _health(self, lines: list[str]) -> int:
         if len(lines) < 5:
@@ -390,3 +401,69 @@ class LangfuseCollector:
             except (KeyError, ValueError, TypeError, telemetry.ContractError) as exc:
                 log.warning("skipping malformed defender observation %s: %s", obs.get("id"), exc)
         return n
+
+
+class CollectorOutages:
+    """Failure streaks of the collectors, recorded as ground truth.
+
+    `guard(name, pull)` wraps a collector's pull: a failure opens an outage (from the last
+    successful pull, or the run's start), the next success closes it and emits
+    `monitor/collector_outage {collector, start, end, seconds, failures, error, recovered: true}`.
+    `close_all()` at teardown emits every outage still open with `recovered: false`."""
+
+    def __init__(self, emit: Callable[[str, dict], Any], since: dt.datetime,
+                 clock: Callable[[], dt.datetime] = telemetry.utc_now) -> None:
+        self.emit, self.clock, self.since = emit, clock, since
+        self.open: dict[str, dict] = {}
+        self.last_ok: dict[str, dt.datetime] = {}
+        self._lock = threading.Lock()
+
+    def guard(self, name: str, pull: Callable[[], Any]) -> Callable[[], Any]:
+        def guarded() -> Any:
+            try:
+                result = pull()
+            except Exception as exc:
+                self.failed(name, exc)
+                raise
+            self.succeeded(name)
+            return result
+        return guarded
+
+    def failed(self, name: str, exc: BaseException) -> None:
+        now = self.clock()
+        error = f"{type(exc).__name__}: {exc}"[:300]
+        with self._lock:
+            o = self.open.get(name)
+            if o is None:
+                self.open[name] = {"collector": name, "start": self.last_ok.get(name, self.since),
+                                   "first_failure": now, "failures": 1, "error": error}
+            else:
+                o["failures"] += 1
+                o["last_error"] = error
+
+    def succeeded(self, name: str) -> None:
+        now = self.clock()
+        with self._lock:
+            self.last_ok[name] = now
+            o = self.open.pop(name, None)
+        if o is not None:
+            self._emit(o, now, recovered=True)
+
+    def close_all(self, note: str = "still failing at the end of the run") -> None:
+        now = self.clock()
+        with self._lock:
+            pending, self.open = list(self.open.values()), {}
+        for o in pending:
+            self._emit(o, now, recovered=False, note=note)
+
+    def _emit(self, o: dict, end: dt.datetime, recovered: bool, note: str | None = None) -> None:
+        payload = {"collector": o["collector"], "start": telemetry.format_ts(o["start"]),
+                   "end": telemetry.format_ts(end), "seconds": round((end - o["start"]).total_seconds(), 1),
+                   "first_failure": telemetry.format_ts(o["first_failure"]), "failures": o["failures"],
+                   "error": o["error"], "recovered": recovered,
+                   **({"last_error": o["last_error"]} if o.get("last_error") else {}),
+                   **({"note": note} if note else {})}
+        try:
+            self.emit("collector_outage", payload)
+        except Exception as exc:                # never let bookkeeping break a collector loop
+            log.warning("collector outage not recorded: %s", exc)

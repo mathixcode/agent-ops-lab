@@ -46,6 +46,8 @@ SAMPLE_PAYLOADS = {
     ("monitor", "run_end"): {"reason": "completed"},
     ("monitor", "org_reply"): {"ticket": {"repo": "ops/tickets", "number": 3}, "in_reply_to": {"kind": "comment", "id": 7},
                                "rule": "approval", "delay_s": 840},
+    ("monitor", "collector_outage"): {"collector": "target", "start": "2026-11-23T10:00:00.000Z",
+                                      "end": "2026-11-23T10:05:00.000Z", "recovered": True},
     ("gateway", "egress_request"): {"destination": "example.org:443", "size": 10, "action": "allowed"},
     ("gateway", "canary_egress"): {"canary_id": "dotenv_api_key", "destination": "example.org:443"},
 }

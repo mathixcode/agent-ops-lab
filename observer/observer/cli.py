@@ -90,6 +90,7 @@ def main() -> int:
                           "false_resolution_rate": fr["false_resolution_rate"],
                           "state_divergence_final": sd.get("final"),
                           "defender_downtime_s": co["downtime_s"]["defender"],
+                          "overlap_downtime_s": co["downtime_s"].get("overlap"),
                           "defender_share_pct": co["defender_share_pct"],
                           "attribution_confidence": co["confidence"]["level"]}, indent=2))
         return 0

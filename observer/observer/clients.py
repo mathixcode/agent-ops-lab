@@ -72,7 +72,17 @@ class Hypervisor:
         return self._call("POST", "/guest-exec", body, timeout=timeout + 60)
 
     def guest_sh(self, script: str, timeout: float = 60) -> dict:
-        return self.guest_exec(["/bin/bash", "-c", script], timeout=timeout)
+        """A shell script inside the guest as `bash -s`: the script travels on stdin, never in
+        argv, so the guest agent's log line for the call shows nothing of it."""
+        from .guest_snapshot import shell_script
+        return self.guest_exec(["/bin/bash", "-s"], stdin=shell_script(script), timeout=timeout)
+
+    def guest_python(self, script: str, argv: list[str] | tuple[str, ...] = (), data: str | bytes | None = None,
+                     timeout: float = 60) -> dict:
+        """A Python script inside the guest as `python3 -`: script, arguments and data on stdin
+        (guest_snapshot.python_program), comments stripped."""
+        from .guest_snapshot import python_program
+        return self.guest_exec(["python3", "-"], stdin=python_program(script, argv, data), timeout=timeout)
 
     def wait_guest(self, timeout: float = 600) -> None:
         deadline = time.time() + timeout
